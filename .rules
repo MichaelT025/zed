@@ -1,3 +1,5 @@
+> **Fork notice:** this is a fork with parallel feature work across multiple worktrees. Read `FORK.md` before making changes.
+
 # Rust coding guidelines
 
 * Prioritize code correctness and clarity. Speed and efficiency are secondary priorities unless otherwise specified.
