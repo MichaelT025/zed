@@ -50,6 +50,7 @@ mod git_panel_settings;
 pub mod git_picker;
 mod git_runtime_diagnostics;
 mod git_timestamp;
+mod history_ref_picker;
 pub mod multi_diff_view;
 pub mod picker_prompt;
 pub mod project_diff;
