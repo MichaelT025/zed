@@ -732,6 +732,9 @@ pub enum LogSource {
     #[default]
     All,
     Branch(SharedString),
+    /// Several revisions shown together, such as a branch, its upstream, and the
+    /// branch it was forked from.
+    Refs(Vec<SharedString>),
     Sha(Oid),
     Path(RepoPath),
 }
@@ -747,6 +750,11 @@ impl LogSource {
                 Cow::Borrowed("HEAD"),
             ],
             LogSource::Branch(branch) => vec![Cow::Borrowed(branch.as_str())],
+            // A ref can disappear between choosing it and running the log (for example
+            // a pruned remote branch), which should drop that ref rather than fail.
+            LogSource::Refs(refs) => std::iter::once(Cow::Borrowed("--ignore-missing"))
+                .chain(refs.iter().map(|git_ref| Cow::Borrowed(git_ref.as_str())))
+                .collect(),
             LogSource::Sha(oid) => vec![Cow::Owned(oid.to_string())],
             LogSource::Path(path) => vec![
                 Cow::Borrowed("--follow"),
@@ -5477,6 +5485,7 @@ mod tests {
         for source in [
             LogSource::All,
             LogSource::Branch("docs/rewrite".into()),
+            LogSource::Refs(vec!["docs/rewrite".into(), "origin/docs/rewrite".into()]),
             LogSource::Sha(Oid::from_str("0000000000000000000000000000000000000000").unwrap()),
         ] {
             let args = source.get_args();
