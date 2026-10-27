@@ -754,12 +754,17 @@ message GetCommitDataResponse {
 
 message GitLogSourceAll {}
 
+message GitLogSourceRefs {
+  repeated string refs = 1;
+}
+
 message GitLogSource {
   oneof source {
     GitLogSourceAll all = 1;
     string branch = 2;
     string sha = 3;
     string path = 4;
+    GitLogSourceRefs refs = 5;
   }
 }
 
