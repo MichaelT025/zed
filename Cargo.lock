@@ -4853,6 +4853,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "devin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "edit_prediction_types",
+ "futures 0.3.34",
+ "gpui",
+ "http_client",
+ "icons",
+ "language",
+ "log",
+ "parking_lot",
+ "paths",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "smol",
+ "text",
+ "tiny_http",
+ "url",
+ "util",
+ "uuid",
+ "zed_credentials_provider",
+]
+
+[[package]]
 name = "diagnostics"
 version = "0.1.0"
 dependencies = [
