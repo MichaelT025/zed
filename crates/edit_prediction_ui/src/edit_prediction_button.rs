@@ -290,6 +290,66 @@ impl Render for EditPredictionButton {
                         .with_handle(self.popover_menu_handle.clone()),
                 )
             }
+            EditPredictionProvider::Devin => {
+                let enabled = self.editor_enabled.unwrap_or(true);
+                let devin_status = devin::Devin::global(cx).read(cx).status();
+                let has_error = matches!(
+                    devin_status,
+                    devin::DevinStatus::SignedOut | devin::DevinStatus::Error(_)
+                );
+                let this = cx.weak_entity();
+
+                div().child(
+                    PopoverMenu::new("devin")
+                        .menu(move |window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.build_edit_prediction_context_menu(
+                                    EditPredictionProvider::Devin,
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .ok()
+                        })
+                        .anchor(Anchor::BottomRight)
+                        .trigger_with_tooltip(
+                            IconButton::new("devin-icon", IconName::ZedPredict)
+                                .shape(IconButtonShape::Square)
+                                .tab_index(0isize)
+                                .aria_label("Edit Prediction")
+                                .when(has_error, |this| {
+                                    this.indicator(Indicator::dot().color(Color::Error))
+                                        .indicator_border_color(Some(
+                                            cx.theme().colors().status_bar_background,
+                                        ))
+                                })
+                                .when(!has_error && !enabled, |this| {
+                                    this.indicator(Indicator::dot().color(Color::Ignored))
+                                        .indicator_border_color(Some(
+                                            cx.theme().colors().status_bar_background,
+                                        ))
+                                }),
+                            move |_window, cx| {
+                                let tooltip_meta = match &devin_status {
+                                    devin::DevinStatus::SignedOut => {
+                                        "Sign in to Devin in the edit prediction settings".into()
+                                    }
+                                    devin::DevinStatus::Error(error) => {
+                                        format!("Devin failed to start: {error}")
+                                    }
+                                    _ => "Powered by Devin".to_string(),
+                                };
+                                Tooltip::with_meta(
+                                    "Edit Prediction",
+                                    Some(&ToggleMenu),
+                                    tooltip_meta,
+                                    cx,
+                                )
+                            },
+                        )
+                        .with_handle(self.popover_menu_handle.clone()),
+                )
+            }
             EditPredictionProvider::Ollama => {
                 let enabled = self.editor_enabled.unwrap_or(true);
                 let this = cx.weak_entity();
@@ -593,6 +653,8 @@ impl EditPredictionButton {
         ] {
             cx.observe(&key_state, |_, _, cx| cx.notify()).detach();
         }
+        let devin = devin::Devin::global(cx);
+        cx.observe(&devin, |_, _, cx| cx.notify()).detach();
 
         Self {
             editor_subscription: None,
@@ -1609,6 +1671,10 @@ pub fn get_available_providers(cx: &mut App) -> Vec<EditPredictionProvider> {
         .has_key()
     {
         providers.push(EditPredictionProvider::Mercury);
+    }
+
+    if devin::Devin::global(cx).read(cx).is_signed_in() {
+        providers.push(EditPredictionProvider::Devin);
     }
 
     providers
