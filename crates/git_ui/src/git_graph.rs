@@ -5072,6 +5072,7 @@ mod persistence {
     pub const LOG_SOURCE_BRANCH: i32 = 1;
     pub const LOG_SOURCE_SHA: i32 = 2;
     pub const LOG_SOURCE_PATH: i32 = 3;
+    pub const LOG_SOURCE_REFS: i32 = 4;
 
     pub const LOG_ORDER_DATE: i32 = 0;
     pub const LOG_ORDER_TOPO: i32 = 1;
@@ -5084,6 +5085,7 @@ mod persistence {
             LogSource::Branch(_) => LOG_SOURCE_BRANCH,
             LogSource::Sha(_) => LOG_SOURCE_SHA,
             LogSource::Path(_) => LOG_SOURCE_PATH,
+            LogSource::Refs(_) => LOG_SOURCE_REFS,
         }
     }
 
@@ -5093,6 +5095,9 @@ mod persistence {
             LogSource::Branch(branch) => Some(branch.to_string()),
             LogSource::Sha(oid) => Some(oid.to_string()),
             LogSource::Path(path) => Some(path.as_unix_str().to_string()),
+            // Git forbids whitespace in ref names, so a newline can't appear inside one.
+            LogSource::Refs(refs) => Some(refs.join("
+")),
         }
     }
 
@@ -5124,6 +5129,11 @@ mod persistence {
                 .as_ref()
                 .and_then(|v| RepoPath::new(v).ok())
                 .map(LogSource::Path)
+                .unwrap_or_default(),
+            Some(LOG_SOURCE_REFS) => state
+                .log_source_value
+                .as_ref()
+                .map(|v| LogSource::Refs(v.lines().map(|git_ref| git_ref.to_string().into()).collect()))
                 .unwrap_or_default(),
             None | Some(_) => LogSource::default(),
         }
