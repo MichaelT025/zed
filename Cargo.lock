@@ -16425,6 +16425,7 @@ dependencies = [
  "copilot_ui",
  "cpal",
  "credentials_provider",
+ "devin",
  "edit_prediction",
  "edit_prediction_ui",
  "editor",
