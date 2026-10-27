@@ -1,4 +1,5 @@
 use codestral::{CODESTRAL_API_URL, codestral_api_key_state, codestral_api_url};
+use devin::{Devin, DevinStatus};
 use edit_prediction::{
     ApiKeyState,
     mercury::{MERCURY_CREDENTIALS_URL, mercury_api_token},
@@ -82,6 +83,7 @@ pub(crate) fn render_edit_prediction_setup_page(
             )
             .into_any_element(),
         ),
+        Some(render_devin_provider(window, cx).into_any_element()),
         Some(render_ollama_provider(settings_window, window, cx).into_any_element()),
         Some(
             render_api_key_provider(
@@ -349,6 +351,111 @@ fn render_api_key_provider(
                 .child(additional_fields),
         )
     })
+}
+
+fn render_devin_provider(
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) -> impl IntoElement {
+    let devin = Devin::global(cx);
+    let weak_page = cx.weak_entity();
+    _ = window.use_keyed_state("devin-status-observer", cx, |_, cx| {
+        cx.observe(&devin, move |_, _, cx| {
+            weak_page.update(cx, |_, cx| cx.notify()).ok();
+        })
+    });
+
+    let (status, sign_in_error, sign_in_url) = {
+        let devin = devin.read(cx);
+        (devin.status(), devin.sign_in_error(), devin.sign_in_url())
+    };
+
+    let header = SettingsSectionHeader::new("Devin")
+        .icon(IconName::ZedPredict)
+        .no_padding(true);
+    let container = v_flex()
+        .id("devin")
+        .min_w_0()
+        .pt_8()
+        .gap_1p5()
+        .child(header);
+
+    if matches!(
+        status,
+        DevinStatus::SignedOut | DevinStatus::LoadingCredentials
+    ) {
+        return container.child(
+            h_flex()
+                .pt_2p5()
+                .w_full()
+                .min_w_0()
+                .justify_between()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .max_w_1_2()
+                        .gap_0p5()
+                        .child(Label::new("Sign-In Code"))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .flex_wrap()
+                                .gap_0p5()
+                                .child(
+                                    ButtonLink::new("Open Devin sign-in", sign_in_url)
+                                        .no_icon(true)
+                                        .label_size(LabelSize::Small)
+                                        .label_color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new(
+                                        "and paste the one-time code it shows. Codes expire after about a minute. Requires Devin Desktop to be installed.",
+                                    )
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                                ),
+                        )
+                        .when_some(sign_in_error, |this, error| {
+                            this.child(
+                                Label::new(error)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Error),
+                            )
+                        }),
+                )
+                .child(
+                    SettingsInputField::new("devin-sign-in-code-input")
+                        .tab_index(0)
+                        .with_placeholder("One-time code")
+                        .aria_label("Devin Sign-In Code")
+                        .on_confirm(move |code, _window, cx| {
+                            if let Some(code) = code.filter(|code| !code.is_empty()) {
+                                devin
+                                    .update(cx, |devin, cx| devin.sign_in_with_code(code, cx))
+                                    .detach_and_log_err(cx);
+                            }
+                        }),
+                ),
+        );
+    }
+
+    let status_label = match &status {
+        DevinStatus::Ready => "Signed In".into(),
+        DevinStatus::Error(error) => format!("Signed In ({error})"),
+        _ => "Signed In".into(),
+    };
+    container.child(
+        ConfiguredApiCard::new("devin-sign-out", status_label)
+            .button_label("Sign Out")
+            .button_tab_index(0)
+            .on_click(move |_, _, cx| {
+                devin
+                    .update(cx, |devin, cx| devin.sign_out(cx))
+                    .detach_and_log_err(cx);
+            }),
+    )
 }
 
 fn render_ollama_provider(
