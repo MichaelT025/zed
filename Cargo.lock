@@ -4868,6 +4868,7 @@ dependencies = [
  "parking_lot",
  "paths",
  "pretty_assertions",
+ "project",
  "serde",
  "serde_json",
  "smol",

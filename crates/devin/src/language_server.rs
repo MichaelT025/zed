@@ -371,6 +371,7 @@ impl DevinLanguageServer {
     pub async fn complete(
         &self,
         document: Document,
+        other_documents: Vec<Document>,
         editor_options: EditorOptions,
         trigger: SupercompleteTriggerCondition,
     ) -> Result<HandleStreamingTabV2Response> {
@@ -386,12 +387,14 @@ impl DevinLanguageServer {
             .await
             .log_err();
         }
-        self.refresh_context_if_needed(&document).await?;
+        self.refresh_context_if_needed(&document, &other_documents)
+            .await?;
         let request = HandleStreamingTabV2Request {
             metadata: self.next_metadata(),
             document,
             editor_options,
             supercomplete_trigger_condition: trigger,
+            other_documents,
             disable_supercomplete: false,
             // Jump suggestions haven't been validated against Zed's jump handling yet.
             disable_tab_jump: true,
@@ -404,7 +407,11 @@ impl DevinLanguageServer {
 
     /// Completions fail upstream until the active document has been registered through this
     /// editor-context lifecycle, which is separate from LSP document synchronization.
-    async fn refresh_context_if_needed(&self, document: &Document) -> Result<()> {
+    async fn refresh_context_if_needed(
+        &self,
+        document: &Document,
+        other_documents: &[Document],
+    ) -> Result<()> {
         let actions = {
             let state = self.context_state.lock();
             if state.active_document_uri.as_deref() == Some(document.absolute_uri.as_str()) {
@@ -430,8 +437,11 @@ impl DevinLanguageServer {
                     &RefreshContextForIdeActionRequest {
                         metadata: self.next_metadata(),
                         active_document: active_document.clone(),
-                        other_documents: Vec::new(),
-                        recently_opened_uris: vec![document.absolute_uri.clone()],
+                        other_documents: other_documents.to_vec(),
+                        recently_opened_uris: std::iter::once(document)
+                            .chain(other_documents)
+                            .map(|document| document.absolute_uri.clone())
+                            .collect(),
                         blocking: true,
                         ide_action,
                     },

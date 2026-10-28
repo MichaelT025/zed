@@ -85,6 +85,30 @@ pub struct Document {
     pub timestamp: String,
 }
 
+impl Document {
+    /// Returns a copy of the document with the cursor at `cursor_offset`, a byte offset into its
+    /// text on a character boundary.
+    pub fn with_cursor(&self, cursor_offset: usize) -> Self {
+        let before_cursor = &self.text[..cursor_offset];
+        let line_start = before_cursor
+            .rfind('\n')
+            .map_or(0, |newline_offset| newline_offset + 1);
+        let cursor = Position {
+            row: before_cursor.matches('\n').count() as u64,
+            col: (cursor_offset - line_start) as u64,
+        };
+        Self {
+            cursor_offset: cursor_offset as u64,
+            cursor_position: Some(cursor.clone()),
+            selections: vec![DocumentRange {
+                start_position: cursor.clone(),
+                end_position: cursor,
+            }],
+            ..self.clone()
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct EditorOptions {
     #[serde(serialize_with = "serialize_u64_string")]
@@ -110,6 +134,7 @@ pub struct HandleStreamingTabV2Request {
     pub document: Document,
     pub editor_options: EditorOptions,
     pub supercomplete_trigger_condition: SupercompleteTriggerCondition,
+    pub other_documents: Vec<Document>,
     pub disable_supercomplete: bool,
     pub disable_tab_jump: bool,
     pub supercomplete_aggression: &'static str,
@@ -728,6 +753,30 @@ mod tests {
         assert_eq!(locate_new_offset(&edits, 6), (5, 0));
         assert_eq!(locate_new_offset(&edits, 10), (8, 1));
         assert_eq!(locate_new_offset(&edits, 12), (10, 0));
+    }
+
+    #[test]
+    fn test_document_with_cursor() {
+        let document = Document {
+            absolute_uri: "file:///synthetic/example.rs".into(),
+            workspace_uri: "file:///synthetic/".into(),
+            text: "fn main() {\n    let é = 1;\n}".into(),
+            editor_language: "rust".into(),
+            language: Some("LANGUAGE_RUST"),
+            cursor_offset: 0,
+            cursor_position: None,
+            selections: Vec::new(),
+            line_ending: "\n".into(),
+            is_dirty: false,
+            timestamp: String::new(),
+        };
+        let with_cursor = document.with_cursor(22);
+        assert_eq!(with_cursor.cursor_offset, 22);
+        let cursor = with_cursor.cursor_position.unwrap();
+        assert_eq!((cursor.row, cursor.col), (1, 10));
+        assert_eq!(with_cursor.selections.len(), 1);
+        let start = document.with_cursor(0).cursor_position.unwrap();
+        assert_eq!((start.row, start.col), (0, 0));
     }
 
     #[test]
