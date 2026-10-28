@@ -2968,15 +2968,12 @@ impl GitPanel {
             (GitPanelClickBehavior::ProjectDiff, false) => GitPanelClickBehavior::ProjectDiff,
             (GitPanelClickBehavior::ProjectDiff, true) => GitPanelClickBehavior::FileDiff,
             (GitPanelClickBehavior::FileDiff, false) => GitPanelClickBehavior::FileDiff,
-            (GitPanelClickBehavior::FileDiff, true) => GitPanelClickBehavior::ProjectDiff,
+            (GitPanelClickBehavior::FileDiff, true) => GitPanelClickBehavior::ViewFile,
             (GitPanelClickBehavior::ViewFile, false) => GitPanelClickBehavior::ViewFile,
             (GitPanelClickBehavior::ViewFile, true) => GitPanelClickBehavior::ProjectDiff,
         };
         match action {
             GitPanelClickBehavior::ProjectDiff => {
-                if secondary {
-                    self.close_click_opened_solo_diff(window, cx);
-                }
                 self.open_diff(&Default::default(), window, cx);
                 self.focus_handle.focus(window, cx);
             }
@@ -2987,6 +2984,9 @@ impl GitPanel {
                 self.open_solo_diff(&Default::default(), window, cx);
             }
             GitPanelClickBehavior::ViewFile => {
+                if secondary {
+                    self.close_click_opened_solo_diff(window, cx);
+                }
                 self.view_file(&Default::default(), window, cx);
             }
         }
@@ -3036,7 +3036,7 @@ impl GitPanel {
     }
 
     /// Dropping the record cancels an open that is still loading; a view that already
-    /// opened is closed so the double-click leaves only the project diff.
+    /// opened is closed so the double-click leaves only the file.
     fn close_click_opened_solo_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(click_opened_solo_diff) = self.click_opened_solo_diff.take() else {
             return;
@@ -11975,7 +11975,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_double_click_replaces_solo_diff_with_project_diff(cx: &mut TestAppContext) {
+    async fn test_double_click_replaces_solo_diff_with_file(cx: &mut TestAppContext) {
         init_test(cx);
         let (_, _, workspace, panel, mut cx) = setup_git_panel_with_changes(
             cx,
@@ -12018,8 +12018,9 @@ mod tests {
                 1,
                 "the double-click should close only the diff its first click opened"
             );
-            assert_eq!(workspace.items_of_type::<ProjectDiff>(cx).count(), 1);
+            assert_eq!(workspace.items_of_type::<ProjectDiff>(cx).count(), 0);
         });
+        assert_editor_opened_with_path(&workspace, Path::new("b.txt"), &mut cx);
 
         click(&panel, "a.txt", false, &mut cx);
         click(&panel, "a.txt", true, &mut cx);
