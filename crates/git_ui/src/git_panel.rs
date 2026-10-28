@@ -125,11 +125,9 @@ const RECENT_COMMIT_COUNT: usize = 3;
 // TODO: We should revise this part. It seems the indentation width is not aligned with the one in project panel
 const TREE_INDENT: f32 = 16.0;
 const MAX_HISTORY_BADGES: usize = 3;
-/// Height of the stacked sections' headers, matching VS Code's Source Control
-/// section headers.
-const SECTION_HEADER_HEIGHT: f32 = 22.0;
+const SECTION_HEADER_HEIGHT: f32 = 28.0;
 /// Invisible hit area around the thin divider between the stacked sections.
-const SECTION_DIVIDER_HANDLE_HEIGHT: f32 = 6.0;
+const SECTION_DIVIDER_HANDLE_HEIGHT: f32 = 10.0;
 const DEFAULT_GRAPH_SECTION_RATIO: f32 = 0.4;
 const MIN_GRAPH_SECTION_RATIO: f32 = 0.15;
 const MAX_GRAPH_SECTION_RATIO: f32 = 0.85;
@@ -7824,13 +7822,13 @@ impl GitPanel {
                     )
                     .child(
                         Label::new(title)
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Small)
                             .weight(FontWeight::SEMIBOLD),
                     )
                     .when_some(count, |this, count| {
                         this.child(
                             Label::new(count.to_string())
-                                .size(LabelSize::XSmall)
+                                .size(LabelSize::Small)
                                 .color(Color::Muted),
                         )
                     }),
@@ -7946,7 +7944,9 @@ impl GitPanel {
             .flex_none()
             .h(px(1.))
             .bg(cx.theme().colors().border_variant)
-            .child(
+            // Deferred so the handle paints above the Graph header, which would
+            // otherwise cover the half of the hit area that overlaps it.
+            .child(deferred(
                 div()
                     .id("git-panel-section-divider-handle")
                     .absolute()
@@ -7956,7 +7956,7 @@ impl GitPanel {
                     .cursor_row_resize()
                     .block_mouse_except_scroll()
                     .on_drag(DraggedSectionDivider, |_, _, _, cx| cx.new(|_| Empty)),
-            )
+            ))
             .into_any_element()
     }
 
