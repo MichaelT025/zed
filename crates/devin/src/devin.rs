@@ -14,8 +14,8 @@ use gpui::{App, AppContext as _, Context, Entity, EntityId, Global, SharedString
 use http_client::{AsyncBody, HttpClient, Method, Request};
 use util::ResultExt as _;
 
-pub use devin_edit_prediction_delegate::DevinEditPredictionDelegate;
 use devin_edit_prediction_delegate::CurrentPrediction;
+pub use devin_edit_prediction_delegate::DevinEditPredictionDelegate;
 use language_server::{API_SERVER_URL, DevinInstallation, DevinLanguageServer};
 use lsp_connection::WorkspaceFolder;
 use protocol::{ExchangeDevinCodeResponse, SEAT_MANAGEMENT_SERVICE};
