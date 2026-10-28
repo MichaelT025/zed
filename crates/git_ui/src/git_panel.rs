@@ -54,10 +54,10 @@ use git::{
 };
 use gpui::{
     AbsoluteLength, Action, Anchor, AnyElement, AsyncApp, AsyncWindowContext, ClickEvent,
-    ClipboardItem, DismissEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
-    KeyContext, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, ScrollStrategy,
-    Subscription, Task, TaskExt, TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored,
-    deferred, uniform_list,
+    ClipboardItem, DismissEvent, DragMoveEvent, Empty, Entity, EventEmitter, FocusHandle,
+    Focusable, FontWeight, Hsla, KeyContext, MouseButton, MouseDownEvent, Pixels, Point,
+    PromptLevel, ScrollStrategy, Subscription, Task, TaskExt, TextStyle, UniformListScrollHandle,
+    WeakEntity, actions, anchored, deferred, uniform_list,
 };
 use itertools::Itertools;
 use language::{Buffer, BufferEvent, File};
@@ -81,8 +81,8 @@ use prompt_store::RULES_FILE_NAMES;
 
 use serde::{Deserialize, Serialize};
 use settings::{
-    GitPanelClickBehavior, GitPanelCommitEditor, GitPanelGroupBy, GitPanelSortBy, Settings,
-    SettingsStore, StatusStyle, update_settings_file,
+    GitPanelClickBehavior, GitPanelCommitEditor, GitPanelGroupBy, GitPanelLayout, GitPanelSortBy,
+    Settings, SettingsStore, StatusStyle, update_settings_file,
 };
 use smallvec::SmallVec;
 use std::cell::Cell;
@@ -123,6 +123,14 @@ const RECENT_COMMIT_COUNT: usize = 3;
 // TODO: We should revise this part. It seems the indentation width is not aligned with the one in project panel
 const TREE_INDENT: f32 = 16.0;
 const MAX_HISTORY_BADGES: usize = 3;
+/// Height of the stacked sections' headers, matching VS Code's Source Control
+/// section headers.
+const SECTION_HEADER_HEIGHT: f32 = 22.0;
+/// Invisible hit area around the thin divider between the stacked sections.
+const SECTION_DIVIDER_HANDLE_HEIGHT: f32 = 6.0;
+const DEFAULT_GRAPH_SECTION_RATIO: f32 = 0.4;
+const MIN_GRAPH_SECTION_RATIO: f32 = 0.15;
+const MAX_GRAPH_SECTION_RATIO: f32 = 0.85;
 // Horizontal offset that aligns the tree indent guides with the row icon column.
 const INDENT_GUIDE_LEFT_OFFSET: gpui::Pixels = gpui::px(19.);
 
@@ -566,6 +574,13 @@ struct SerializedGitPanel {
     /// `None` means the user never toggled it, so the setting decides.
     #[serde(default)]
     commit_editor_collapsed: Option<bool>,
+    #[serde(default)]
+    changes_section_collapsed: bool,
+    #[serde(default)]
+    graph_section_collapsed: bool,
+    /// `None` in panels saved before the stacked layout existed.
+    #[serde(default)]
+    graph_section_ratio: Option<f32>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -583,6 +598,10 @@ enum GitPanelTab {
     Changes,
     History,
 }
+
+/// Dragged when resizing the boundary between the stacked Changes and Graph
+/// sections.
+struct DraggedSectionDivider;
 
 fn commit_history_tags_by_sha(
     commits: &[Arc<InitialGraphCommitData>],
@@ -1303,6 +1322,11 @@ pub struct GitPanel {
     bulk_staging: Option<BulkStaging>,
     stash_entries: GitStash,
     active_tab: GitPanelTab,
+    changes_section_collapsed: bool,
+    graph_section_collapsed: bool,
+    /// Fraction of the stacked split container's height given to the Graph
+    /// section, including its header.
+    graph_section_ratio: f32,
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history: CommitHistory,
     focused_history_entry: Option<usize>,
@@ -1430,6 +1454,17 @@ impl GitPanel {
             .unwrap_or_else(|| {
                 GitPanelSettings::get_global(cx).commit_editor == GitPanelCommitEditor::Collapsed
             });
+        let changes_section_collapsed = serialized_panel
+            .as_ref()
+            .is_some_and(|panel| panel.changes_section_collapsed);
+        let graph_section_collapsed = serialized_panel
+            .as_ref()
+            .is_some_and(|panel| panel.graph_section_collapsed);
+        let graph_section_ratio = serialized_panel
+            .as_ref()
+            .and_then(|panel| panel.graph_section_ratio)
+            .unwrap_or(DEFAULT_GRAPH_SECTION_RATIO)
+            .clamp(MIN_GRAPH_SECTION_RATIO, MAX_GRAPH_SECTION_RATIO);
         let active_work_directory_abs_path = active_repository.as_ref().map(|repository| {
             repository
                 .read(cx)
@@ -1470,6 +1505,7 @@ impl GitPanel {
             let mut was_folder_indicator = GitPanelSettings::get_global(cx).folder_indicator;
             let mut was_diff_stats = GitPanelSettings::get_global(cx).diff_stats;
             let mut was_commit_editor = GitPanelSettings::get_global(cx).commit_editor;
+            let mut was_layout = GitPanelSettings::get_global(cx).layout;
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
                 let settings = GitPanelSettings::get_global(cx);
                 let sort_by = settings.sort_by;
@@ -1479,6 +1515,7 @@ impl GitPanel {
                 let folder_indicator = settings.folder_indicator;
                 let diff_stats = settings.diff_stats;
                 let commit_editor = settings.commit_editor;
+                let layout = settings.layout;
                 // Changing the setting is an explicit request, so it wins over
                 // whatever this workspace last persisted.
                 if commit_editor != was_commit_editor {
@@ -1515,6 +1552,12 @@ impl GitPanel {
                 if file_icons != was_file_icons || folder_indicator != was_folder_indicator {
                     cx.notify();
                 }
+                if layout != was_layout {
+                    if this.is_section_visible(GitPanelTab::History, cx) {
+                        this.load_commit_history(cx);
+                    }
+                    cx.notify();
+                }
                 was_sort_by = sort_by;
                 was_group_by = group_by;
                 was_tree_view = tree_view;
@@ -1522,6 +1565,7 @@ impl GitPanel {
                 was_folder_indicator = folder_indicator;
                 was_diff_stats = diff_stats;
                 was_commit_editor = commit_editor;
+                was_layout = layout;
             })
             .detach();
 
@@ -1649,6 +1693,9 @@ impl GitPanel {
                 bulk_staging: None,
                 stash_entries: Default::default(),
                 active_tab: GitPanelTab::Changes,
+                changes_section_collapsed,
+                graph_section_collapsed,
+                graph_section_ratio,
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history: CommitHistory::Loading,
                 focused_history_entry: None,
@@ -2108,6 +2155,9 @@ impl GitPanel {
             .commit_editor_toggled
             .then_some(self.commit_editor_collapsed);
         let commit_messages = self.serialized_commit_messages(cx);
+        let changes_section_collapsed = self.changes_section_collapsed;
+        let graph_section_collapsed = self.graph_section_collapsed;
+        let graph_section_ratio = Some(self.graph_section_ratio);
         let kvp = KeyValueStore::global(cx);
 
         self.pending_serialization = cx.spawn(async move |git_panel, cx| {
@@ -2135,6 +2185,9 @@ impl GitPanel {
                             signoff_enabled,
                             commit_messages,
                             commit_editor_collapsed,
+                            changes_section_collapsed,
+                            graph_section_collapsed,
+                            graph_section_ratio,
                         })?,
                     )
                     .await?;
@@ -2665,6 +2718,9 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if Self::is_stacked_layout(cx) {
+            self.activate_section_from_pointer(GitPanelTab::Changes, cx);
+        }
         self.focus_handle.focus(window, cx);
         self.select_first_entry_if_none(window, cx);
     }
@@ -5734,7 +5790,7 @@ impl GitPanel {
         self.active_repository = new_active_repository;
         self.reopen_commit_buffer(window, cx);
         self.preload_commit_history(cx);
-        if self.active_tab == GitPanelTab::History
+        if self.is_section_visible(GitPanelTab::History, cx)
             && matches!(self.commit_history, CommitHistory::Loading)
             && !self.history_layout.in_flight
         {
@@ -6946,6 +7002,9 @@ impl GitPanel {
                 })
             }
         });
+        if !self.commit_editor_expanded && self.is_section_visible(GitPanelTab::History, cx) {
+            self.load_commit_history(cx);
+        }
 
         cx.notify();
     }
@@ -7643,41 +7702,337 @@ impl GitPanel {
             ))
     }
 
+    /// The Changes content, in the same order the Changes tab renders it.
+    fn render_changes_content(
+        &self,
+        has_entries: bool,
+        has_write_access: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_hidden()
+            .children(self.render_changes_header(window, cx))
+            .when(!self.commit_editor_expanded, |this| {
+                this.map(|this| {
+                    if let Some(repo) = self.active_repository.clone()
+                        && has_entries
+                    {
+                        this.child(self.render_entries(has_write_access, repo, window, cx))
+                    } else {
+                        this.child(self.render_empty_state(cx).into_any_element())
+                    }
+                })
+            })
+            .children(self.render_footer(window, cx))
+            .when(self.amend_pending, |this| {
+                this.child(self.render_pending_amend(cx))
+            })
+            .when(!self.amend_pending, |this| {
+                this.children(self.render_previous_commit(window, cx))
+            })
+            .into_any_element()
+    }
+
+    fn render_section_header(
+        &self,
+        id: impl Into<ElementId>,
+        title: &'static str,
+        expanded: bool,
+        count: Option<usize>,
+        trailing: Option<AnyElement>,
+        section: GitPanelTab,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = id.into();
+        let disclosure_id = id.clone();
+        h_flex()
+            .h(px(SECTION_HEADER_HEIGHT))
+            .w_full()
+            .flex_none()
+            .px_1()
+            .gap_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .bg(cx.theme().colors().panel_background)
+            .child(
+                h_flex()
+                    .id(id)
+                    .h_full()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .cursor_pointer()
+                    .hover(|this| this.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_panel_section_collapsed(section, cx);
+                    }))
+                    .child(
+                        ui::Disclosure::new(disclosure_id, expanded).on_click(cx.listener(
+                            move |this, _, _, cx| this.toggle_panel_section_collapsed(section, cx),
+                        )),
+                    )
+                    .child(
+                        Label::new(title)
+                            .size(LabelSize::XSmall)
+                            .weight(FontWeight::SEMIBOLD),
+                    )
+                    .when_some(count, |this, count| {
+                        this.child(
+                            Label::new(count.to_string())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    }),
+            )
+            .when_some(trailing, |this, trailing| this.child(trailing))
+            .into_any_element()
+    }
+
+    fn render_changes_section(
+        &self,
+        has_entries: bool,
+        has_write_access: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let expanded = !self.changes_section_collapsed;
+        let count = (self.changes_count > 0).then_some(self.changes_count);
+        let header = self.render_section_header(
+            "git-panel-changes-section-header",
+            "CHANGES",
+            expanded,
+            count,
+            None,
+            GitPanelTab::Changes,
+            cx,
+        );
+
+        v_flex()
+            .w_full()
+            .min_h_0()
+            .flex_none()
+            .overflow_hidden()
+            .when(expanded, |this| this.flex_1())
+            .child(header)
+            .when(expanded, |this| {
+                this.child(
+                    v_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .overflow_hidden()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.activate_section_from_pointer(GitPanelTab::Changes, cx)
+                            }),
+                        )
+                        .child(self.render_changes_content(
+                            has_entries,
+                            has_write_access,
+                            window,
+                            cx,
+                        )),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_graph_section(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let expanded = !self.graph_section_collapsed;
+        let pickers = self
+            .active_repository
+            .is_some()
+            .then(|| self.render_history_pickers(window, cx).into_any_element());
+        let header = self.render_section_header(
+            "git-panel-graph-section-header",
+            "GRAPH",
+            expanded,
+            None,
+            pickers,
+            GitPanelTab::History,
+            cx,
+        );
+        let changes_expanded = !self.changes_section_collapsed;
+
+        v_flex()
+            .w_full()
+            .min_h_0()
+            .flex_none()
+            .overflow_hidden()
+            .when(expanded, |this| {
+                if changes_expanded {
+                    this.h(relative(self.graph_section_ratio))
+                } else {
+                    this.flex_1()
+                }
+            })
+            .child(header)
+            .when(expanded, |this| {
+                this.child(
+                    v_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .overflow_hidden()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.activate_section_from_pointer(GitPanelTab::History, cx)
+                            }),
+                        )
+                        .child(self.render_history_body(window, cx)),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_section_divider(&self, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .id("git-panel-section-divider")
+            .relative()
+            .w_full()
+            .flex_none()
+            .h(px(1.))
+            .bg(cx.theme().colors().border_variant)
+            .child(
+                div()
+                    .id("git-panel-section-divider-handle")
+                    .absolute()
+                    .top(px(-SECTION_DIVIDER_HANDLE_HEIGHT / 2.))
+                    .w_full()
+                    .h(px(SECTION_DIVIDER_HANDLE_HEIGHT))
+                    .cursor_row_resize()
+                    .block_mouse_except_scroll()
+                    .on_drag(DraggedSectionDivider, |_, _, _, cx| cx.new(|_| Empty)),
+            )
+            .into_any_element()
+    }
+
+    fn render_stacked_sections(
+        &self,
+        has_entries: bool,
+        has_write_access: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let both_expanded = !self.changes_section_collapsed && !self.graph_section_collapsed;
+        let changes_section =
+            self.render_changes_section(has_entries, has_write_access, window, cx);
+        let graph_section = self.render_graph_section(window, cx);
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_hidden()
+            .on_drag_move::<DraggedSectionDivider>(cx.listener(
+                |this, event: &DragMoveEvent<DraggedSectionDivider>, _window, cx| {
+                    this.update_graph_section_ratio(event, cx);
+                },
+            ))
+            .on_drop::<DraggedSectionDivider>(cx.listener(|this, _, _window, cx| {
+                this.serialize(cx);
+            }))
+            .child(changes_section)
+            .when(both_expanded, |this| {
+                this.child(self.render_section_divider(cx))
+            })
+            .child(graph_section)
+            .into_any_element()
+    }
+
+    fn render_panel_body(
+        &self,
+        has_entries: bool,
+        has_write_access: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let layout = GitPanelSettings::get_global(cx).layout;
+        v_flex()
+            .size_full()
+            .when(
+                !self.commit_editor_expanded && layout == GitPanelLayout::Tabs,
+                |this| this.child(self.render_tab_bar(cx)),
+            )
+            .child(if self.commit_editor_expanded {
+                self.render_changes_content(has_entries, has_write_access, window, cx)
+            } else {
+                match layout {
+                    GitPanelLayout::Stacked => {
+                        self.render_stacked_sections(has_entries, has_write_access, window, cx)
+                    }
+                    GitPanelLayout::Tabs if self.active_tab == GitPanelTab::History => {
+                        self.render_history_tab(window, cx).into_any_element()
+                    }
+                    GitPanelLayout::Tabs => {
+                        self.render_changes_content(has_entries, has_write_access, window, cx)
+                    }
+                }
+            })
+            .into_any_element()
+    }
+
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_repository = self.active_repository.is_some();
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .size_full()
+            .overflow_hidden()
+            .when(has_repository, |this| {
+                this.child(self.render_history_toolbar(window, cx))
+            })
+            .child(self.render_history_body(window, cx))
+    }
+
+    fn render_history_body(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_repository = self.active_repository.is_some();
 
         v_flex()
             .flex_1()
             .size_full()
             .overflow_hidden()
-            .when(has_repository, |this| {
-                this.child(self.render_history_toolbar(window, cx))
-            })
-            .child(v_flex().flex_1().size_full().overflow_hidden().map(|this| {
-                match &self.commit_history {
-                    _ if !has_repository => {
-                        this.child(Self::render_history_placeholder("No repository found"))
-                    }
-                    CommitHistory::Error(_) => this.child(Self::render_history_placeholder(
-                        "Failed to load commit history",
-                    )),
-                    CommitHistory::Loading => {
-                        this.child(Self::render_history_placeholder("Loading Commit History…"))
-                    }
-                    CommitHistory::Loaded(entries) if entries.is_empty() => {
-                        this.child(Self::render_history_placeholder("No commits yet"))
-                    }
-                    CommitHistory::Loaded(_) => match self.render_commit_history(window, cx) {
-                        Some(history) => this.child(history),
-                        None => {
-                            this.child(Self::render_history_placeholder("Failed to load commits"))
-                        }
-                    },
+            .map(|this| match &self.commit_history {
+                _ if !has_repository => {
+                    this.child(Self::render_history_placeholder("No repository found"))
                 }
-            }))
+                CommitHistory::Error(_) => this.child(Self::render_history_placeholder(
+                    "Failed to load commit history",
+                )),
+                CommitHistory::Loading => {
+                    this.child(Self::render_history_placeholder("Loading Commit History…"))
+                }
+                CommitHistory::Loaded(entries) if entries.is_empty() => {
+                    this.child(Self::render_history_placeholder("No commits yet"))
+                }
+                CommitHistory::Loaded(_) => match self.render_commit_history(window, cx) {
+                    Some(history) => this.child(history),
+                    None => this.child(Self::render_history_placeholder("Failed to load commits")),
+                },
+            })
     }
 
     fn render_history_toolbar(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .h(px(28.))
+            .px_2()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(self.render_history_pickers(window, cx))
+    }
+
+    fn render_history_pickers(
         &self,
         _window: &mut Window,
         cx: &mut Context<Self>,
@@ -7706,11 +8061,8 @@ impl GitPanel {
         });
 
         h_flex()
-            .h(px(28.))
-            .px_2()
             .gap_0p5()
-            .border_b_1()
-            .border_color(cx.theme().colors().border_variant)
+            .flex_none()
             .when_some(repository_name, |this, repository_name| {
                 this.child(
                     PopoverMenu::new("history-repository-picker")
@@ -7936,13 +8288,78 @@ impl GitPanel {
         self.set_active_tab(GitPanelTab::History, window, cx);
     }
 
-    fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_tab == tab {
+    /// Whether a section's content is on screen. `active_tab` only tracks which
+    /// section receives keyboard input, and in the stacked layout both sections
+    /// can be visible at once.
+    fn is_section_visible(&self, section: GitPanelTab, cx: &App) -> bool {
+        if !Self::is_stacked_layout(cx) {
+            return self.active_tab == section;
+        }
+        match section {
+            GitPanelTab::Changes => !self.changes_section_collapsed,
+            GitPanelTab::History => !self.graph_section_collapsed && !self.commit_editor_expanded,
+        }
+    }
+
+    fn is_stacked_layout(cx: &App) -> bool {
+        GitPanelSettings::get_global(cx).layout == GitPanelLayout::Stacked
+    }
+
+    fn set_section_collapsed(&mut self, section: GitPanelTab, collapsed: bool) {
+        match section {
+            GitPanelTab::Changes => self.changes_section_collapsed = collapsed,
+            GitPanelTab::History => self.graph_section_collapsed = collapsed,
+        }
+    }
+
+    fn toggle_panel_section_collapsed(&mut self, section: GitPanelTab, cx: &mut Context<Self>) {
+        let collapsed = match section {
+            GitPanelTab::Changes => self.changes_section_collapsed,
+            GitPanelTab::History => self.graph_section_collapsed,
+        };
+        self.set_section_collapsed(section, !collapsed);
+        if section == GitPanelTab::History && self.is_section_visible(section, cx) {
+            self.load_commit_history(cx);
+        }
+        self.serialize(cx);
+        cx.notify();
+    }
+
+    /// Points keyboard routing at the section the user clicked in, without
+    /// taking focus away from the commit editor or the list rows.
+    fn activate_section_from_pointer(&mut self, section: GitPanelTab, cx: &mut Context<Self>) {
+        if self.active_tab != section {
+            self.active_tab = section;
+            cx.notify();
+        }
+    }
+
+    fn update_graph_section_ratio(
+        &mut self,
+        event: &DragMoveEvent<DraggedSectionDivider>,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = event.bounds;
+        let container_height = bounds.bottom() - bounds.top();
+        if container_height <= px(0.) {
             return;
         }
+        let graph_height = bounds.bottom() - event.event.position.y;
+        self.graph_section_ratio = (graph_height / container_height)
+            .clamp(MIN_GRAPH_SECTION_RATIO, MAX_GRAPH_SECTION_RATIO);
+        cx.notify();
+    }
+
+    fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
+        let was_visible = self.is_section_visible(tab, cx);
         self.active_tab = tab;
-        self.activation_focus_handle(cx).focus(window, cx);
-        if tab == GitPanelTab::History {
+        if Self::is_stacked_layout(cx) {
+            self.set_section_collapsed(tab, false);
+            self.focus_handle.focus(window, cx);
+        } else {
+            self.activation_focus_handle(cx).focus(window, cx);
+        }
+        if tab == GitPanelTab::History && !was_visible && self.is_section_visible(tab, cx) {
             self.load_commit_history(cx);
         }
         cx.notify();
@@ -7979,7 +8396,7 @@ impl GitPanel {
                 if Some(key) != self.current_history_key(cx).as_ref() {
                     return;
                 }
-                if self.active_tab != GitPanelTab::History {
+                if !self.is_section_visible(GitPanelTab::History, cx) {
                     self.history_stale = true;
                     return;
                 }
@@ -8009,7 +8426,7 @@ impl GitPanel {
     /// Defers the refresh by a tick so the repository's own subscriber has had a
     /// chance to drop its graph cache for the repository event that triggered it.
     fn refresh_history_next_tick(&mut self, restart: bool, cx: &mut Context<Self>) {
-        if self.active_tab != GitPanelTab::History {
+        if !self.is_section_visible(GitPanelTab::History, cx) {
             self.history_stale = true;
             return;
         }
@@ -8149,7 +8566,7 @@ impl GitPanel {
         if !active_repository_is_resolved {
             return;
         }
-        if self.active_tab == GitPanelTab::History {
+        if self.is_section_visible(GitPanelTab::History, cx) {
             self.refresh_commit_history(true, cx);
         } else {
             self.preload_commit_history(cx);
@@ -8159,7 +8576,7 @@ impl GitPanel {
     /// Rebuilds the History graph for the current filter. With `restart`, an
     /// in-flight layout for the same key is dropped, so new refs apply at once.
     fn refresh_commit_history(&mut self, restart: bool, cx: &mut Context<Self>) {
-        if self.active_tab != GitPanelTab::History {
+        if !self.is_section_visible(GitPanelTab::History, cx) {
             self.history_stale = true;
             return;
         }
@@ -10395,42 +10812,7 @@ impl Render for GitPanel {
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)
-            .child(
-                v_flex()
-                    .size_full()
-                    .when(!self.commit_editor_expanded, |this| {
-                        this.child(self.render_tab_bar(cx))
-                    })
-                    .map(|this| match self.active_tab {
-                        GitPanelTab::Changes => this
-                            .children(self.render_changes_header(window, cx))
-                            .when(!self.commit_editor_expanded, |this| {
-                                this.map(|this| {
-                                    if let Some(repo) = self.active_repository.clone()
-                                        && has_entries
-                                    {
-                                        this.child(self.render_entries(
-                                            has_write_access,
-                                            repo,
-                                            window,
-                                            cx,
-                                        ))
-                                    } else {
-                                        this.child(self.render_empty_state(cx).into_any_element())
-                                    }
-                                })
-                            })
-                            .children(self.render_footer(window, cx))
-                            .when(self.amend_pending, |this| {
-                                this.child(self.render_pending_amend(cx))
-                            })
-                            .when(!self.amend_pending, |this| {
-                                this.children(self.render_previous_commit(window, cx))
-                            }),
-                        GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
-                    })
-                    .into_any_element(),
-            )
+            .child(self.render_panel_body(has_entries, has_write_access, window, cx))
             .children(self.context_menu.as_ref().map(|context_menu| {
                 deferred(
                     anchored()
@@ -11110,6 +11492,16 @@ mod tests {
             language_model::init(cx);
             editor::init(cx);
             crate::init(cx);
+        });
+    }
+
+    fn set_git_panel_layout(cx: &mut TestAppContext, layout: GitPanelLayout) {
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().layout = Some(layout);
+                })
+            });
         });
     }
 
@@ -11926,9 +12318,239 @@ mod tests {
         entries.clone()
     }
 
+    async fn history_panel_with_linear_commits(
+        cx: &mut TestAppContext,
+    ) -> (Entity<GitPanel>, VisualTestContext) {
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+
+        let dot_git = Path::new(path!("/root/project/.git"));
+        let first: Oid = "1111111111111111111111111111111111111111".parse().unwrap();
+        let second: Oid = "2222222222222222222222222222222222222222".parse().unwrap();
+        fs.set_branch_name(dot_git, Some("main"));
+        fs.with_git_state(dot_git, false, |state| {
+            state.refs.insert("HEAD".into(), second.to_string());
+            state.graph_commits = vec![
+                Arc::new(git::repository::InitialGraphCommitData {
+                    sha: second,
+                    parents: SmallVec::from_slice(&[first]),
+                    ref_names: Vec::new(),
+                }),
+                Arc::new(git::repository::InitialGraphCommitData {
+                    sha: first,
+                    parents: SmallVec::new(),
+                    ref_names: Vec::new(),
+                }),
+            ];
+        })
+        .unwrap();
+
+        let (_, panel, cx) = history_panel_setup(fs, cx).await;
+        (panel, cx)
+    }
+
+    #[gpui::test]
+    async fn test_stacked_layout_loads_history_without_activating_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (panel, mut cx) = history_panel_with_linear_commits(cx).await;
+        wait_for_history_layout_to_settle(&panel, &mut cx).await;
+
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(
+                GitPanelSettings::get_global(cx).layout,
+                GitPanelLayout::Stacked
+            );
+            assert_eq!(
+                panel.active_tab,
+                GitPanelTab::Changes,
+                "no tab was activated, so Changes still owns keyboard input"
+            );
+            assert_eq!(loaded_history_entries(panel).len(), 2);
+            assert!(panel.is_section_visible(GitPanelTab::History, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_stacked_layout_repository_change_after_collapse_is_deferred(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let (panel, mut cx) = history_panel_with_linear_commits(cx).await;
+
+        wait_for_history_layout_to_settle(&panel, &mut cx).await;
+        let entries_before = panel.read_with(&cx, |panel, _| loaded_history_entries(panel));
+        assert_eq!(entries_before.len(), 2);
+        let generation_before = panel.read_with(&cx, |panel, _| panel.history_layout.generation);
+
+        panel.update_in(&mut cx, |panel, _, cx| {
+            panel.toggle_panel_section_collapsed(GitPanelTab::History, cx);
+            assert!(panel.graph_section_collapsed);
+            assert!(!panel.is_section_visible(GitPanelTab::History, cx));
+        });
+        cx.run_until_parked();
+
+        panel.update_in(&mut cx, |panel, _, cx| {
+            panel.handle_repository_event(&RepositoryEvent::HeadChanged, cx);
+            assert!(
+                panel.history_stale,
+                "a collapsed Graph section should only mark the history stale"
+            );
+            assert!(!panel.history_refresh_scheduled);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(panel.history_layout.generation, generation_before);
+            assert!(Rc::ptr_eq(&loaded_history_entries(panel), &entries_before));
+        });
+
+        panel.update_in(&mut cx, |panel, _, cx| {
+            panel.toggle_panel_section_collapsed(GitPanelTab::History, cx);
+            assert!(!panel.graph_section_collapsed);
+        });
+        wait_for_history_layout_to_settle(&panel, &mut cx).await;
+
+        panel.read_with(&cx, |panel, _| {
+            assert!(!panel.history_stale);
+            assert!(panel.history_layout.generation > generation_before);
+            assert_eq!(loaded_history_entries(panel).len(), 2);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_tabs_layout_defers_history_until_tab_activated(cx: &mut TestAppContext) {
+        init_test(cx);
+        set_git_panel_layout(cx, GitPanelLayout::Tabs);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+
+        let dot_git = Path::new(path!("/root/project/.git"));
+        let sha: Oid = "0123456789012345678901234567890123456789".parse().unwrap();
+        fs.set_branch_name(dot_git, Some("main"));
+        fs.with_git_state(dot_git, false, |state| {
+            state.refs.insert("HEAD".into(), sha.to_string());
+            state.graph_commits = vec![Arc::new(git::repository::InitialGraphCommitData {
+                sha,
+                parents: SmallVec::new(),
+                ref_names: Vec::new(),
+            })];
+        })
+        .unwrap();
+
+        let (_, panel, mut cx) = history_panel_setup(fs, cx).await;
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert!(!panel.is_section_visible(GitPanelTab::History, cx));
+            assert_eq!(
+                panel.commit_history,
+                CommitHistory::Loading,
+                "the Tabs layout loads the graph only when the History tab is activated"
+            );
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_history_tab(&ActivateHistoryTab, window, cx);
+        });
+        wait_for_history_layout_to_settle(&panel, &mut cx).await;
+
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(loaded_history_entries(panel).len(), 1);
+        });
+    }
+
+    #[test]
+    fn test_serialized_git_panel_round_trips_section_state() {
+        let serialized = SerializedGitPanel {
+            changes_section_collapsed: true,
+            graph_section_collapsed: true,
+            graph_section_ratio: Some(0.62),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&serialized).unwrap();
+        let restored: SerializedGitPanel = serde_json::from_str(&json).unwrap();
+
+        assert!(restored.changes_section_collapsed);
+        assert!(restored.graph_section_collapsed);
+        assert_eq!(restored.graph_section_ratio, Some(0.62));
+    }
+
+    #[gpui::test]
+    async fn test_stacked_layout_renders_both_sections(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_, _, workspace, panel, mut cx) = setup_git_panel_with_changes(
+            cx,
+            json!({
+                ".git": {},
+                "file": "modified\n",
+            }),
+            &[("file", StatusCode::Modified)],
+        )
+        .await;
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_resize(gpui::size(px(800.), px(600.)));
+
+        panel.update_in(&mut cx, |panel, _, cx| {
+            panel.toggle_panel_section_collapsed(GitPanelTab::Changes, cx);
+            panel.toggle_panel_section_collapsed(GitPanelTab::History, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_resize(gpui::size(px(800.), px(600.)));
+
+        panel.update_in(&mut cx, |panel, _, cx| {
+            panel.toggle_panel_section_collapsed(GitPanelTab::Changes, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_resize(gpui::size(px(800.), px(600.)));
+
+        panel.update_in(&mut cx, |panel, _, cx| {
+            panel.toggle_panel_section_collapsed(GitPanelTab::Changes, cx);
+            panel.toggle_panel_section_collapsed(GitPanelTab::History, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_resize(gpui::size(px(800.), px(600.)));
+    }
+
+    #[gpui::test]
+    async fn test_legacy_serialized_panel_restores_default_section_state(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_, _, workspace, _panel, mut cx) =
+            setup_git_panel_with_changes(cx, json!({ ".git": {} }), &[]).await;
+
+        let legacy: SerializedGitPanel = serde_json::from_str(
+            r#"{"signoff_enabled":false,"commit_messages":{},"commit_editor_collapsed":null}"#,
+        )
+        .unwrap();
+        assert!(!legacy.changes_section_collapsed);
+        assert!(!legacy.graph_section_collapsed);
+        assert_eq!(legacy.graph_section_ratio, None);
+
+        let restored = workspace.update_in(&mut cx, |workspace, window, cx| {
+            GitPanel::new_with_serialized_panel(workspace, Some(legacy), window, cx)
+        });
+        cx.run_until_parked();
+
+        restored.read_with(&cx, |panel, _| {
+            assert!(!panel.changes_section_collapsed);
+            assert!(!panel.graph_section_collapsed);
+            assert_eq!(panel.graph_section_ratio, DEFAULT_GRAPH_SECTION_RATIO);
+        });
+    }
+
     #[gpui::test]
     async fn test_history_tab_stops_loading_for_unborn_branch(cx: &mut TestAppContext) {
         init_test(cx);
+        set_git_panel_layout(cx, GitPanelLayout::Tabs);
 
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
@@ -11952,6 +12574,7 @@ mod tests {
     #[gpui::test]
     async fn test_history_tab_loads_detached_head(cx: &mut TestAppContext) {
         init_test(cx);
+        set_git_panel_layout(cx, GitPanelLayout::Tabs);
 
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
@@ -11987,6 +12610,7 @@ mod tests {
     #[gpui::test]
     async fn test_history_tab_loads_linear_commit_graph(cx: &mut TestAppContext) {
         init_test(cx);
+        set_git_panel_layout(cx, GitPanelLayout::Tabs);
 
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
@@ -12041,6 +12665,7 @@ mod tests {
     #[gpui::test]
     async fn test_history_tab_keeps_entries_when_switching_tabs(cx: &mut TestAppContext) {
         init_test(cx);
+        set_git_panel_layout(cx, GitPanelLayout::Tabs);
 
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
@@ -12103,6 +12728,7 @@ mod tests {
     #[gpui::test]
     async fn test_history_tab_auto_filter_logs_base_on_first_layout(cx: &mut TestAppContext) {
         init_test(cx);
+        set_git_panel_layout(cx, GitPanelLayout::Tabs);
 
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
@@ -12162,6 +12788,7 @@ mod tests {
     #[gpui::test]
     async fn test_history_tab_ignores_graph_events_for_other_keys(cx: &mut TestAppContext) {
         init_test(cx);
+        set_git_panel_layout(cx, GitPanelLayout::Tabs);
 
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
@@ -12217,6 +12844,7 @@ mod tests {
     #[gpui::test]
     async fn test_history_tab_surfaces_load_error(cx: &mut TestAppContext) {
         init_test(cx);
+        set_git_panel_layout(cx, GitPanelLayout::Tabs);
 
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
@@ -12247,6 +12875,7 @@ mod tests {
     #[gpui::test]
     async fn test_history_tab_without_repository(cx: &mut TestAppContext) {
         init_test(cx);
+        set_git_panel_layout(cx, GitPanelLayout::Tabs);
 
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree("/root", json!({ "project": {} })).await;
@@ -14096,6 +14725,9 @@ mod tests {
                 signoff_enabled: false,
                 commit_messages: panel.serialized_commit_messages(cx),
                 commit_editor_collapsed: None,
+                changes_section_collapsed: false,
+                graph_section_collapsed: false,
+                graph_section_ratio: None,
             }
         });
 
@@ -14148,6 +14780,7 @@ mod tests {
                     ..Default::default()
                 },
             )]),
+            ..Default::default()
         };
         let mismatched_panel = workspace.update_in(cx, |workspace, window, cx| {
             GitPanel::new_with_serialized_panel(
@@ -14239,6 +14872,7 @@ mod tests {
             signoff_enabled: false,
             commit_messages: panel.serialized_commit_messages(cx),
             commit_editor_collapsed: None,
+            ..Default::default()
         });
         let buffer = repository.read_with(cx, |repository, _| {
             repository.commit_message_buffer().unwrap().clone()
@@ -14335,6 +14969,7 @@ mod tests {
             signoff_enabled: false,
             commit_messages: panel.serialized_commit_messages(cx),
             commit_editor_collapsed: None,
+            ..Default::default()
         });
 
         // Simulate a restart and restore from the serialized state.
@@ -16096,6 +16731,7 @@ mod tests {
     #[gpui::test]
     async fn test_history_tab_pane_navigation_focuses_rendered_panel(cx: &mut TestAppContext) {
         init_test(cx);
+        set_git_panel_layout(cx, GitPanelLayout::Tabs);
 
         let (_, _project, workspace, panel, mut cx) =
             setup_git_panel_with_changes(cx, json!({ ".git": {} }), &[]).await;
