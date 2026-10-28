@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use futures::{AsyncReadExt as _, FutureExt as _, future::Shared};
-use gpui::{App, AppContext as _, Context, Entity, Global, SharedString, Task};
+use gpui::{App, AppContext as _, Context, Entity, EntityId, Global, SharedString, Task};
 use http_client::{AsyncBody, HttpClient, Method, Request};
 use util::ResultExt as _;
 
@@ -23,6 +23,7 @@ const SIGN_IN_URL: &str = "https://app.devin.ai/auth/windsurf/show-auth-code";
 const CREDENTIALS_USERNAME: &str = "devin";
 const SESSION_TOKEN_PREFIX: &str = "devin-session-token$";
 const RESTART_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_RECENT_BUFFERS: usize = 64;
 
 type ServerTask = Shared<Task<Result<Arc<DevinLanguageServer>, SharedString>>>;
 
@@ -42,6 +43,9 @@ pub struct Devin {
     server: Option<(ServerTask, Instant)>,
     sign_in_error: Option<SharedString>,
     sign_in_url: String,
+    /// Buffers that requested predictions, most recent first, used to prioritize the open
+    /// documents sent as context.
+    recent_buffers: Vec<EntityId>,
     _load_credentials: Task<()>,
 }
 
@@ -94,6 +98,7 @@ impl Devin {
                 "{SIGN_IN_URL}?state={}&prompt=select_account&from=redirect",
                 uuid::Uuid::new_v4()
             ),
+            recent_buffers: Vec::new(),
             _load_credentials: load_credentials,
         }
     }
@@ -166,6 +171,16 @@ impl Devin {
         self.server = Some((server.clone(), Instant::now()));
         cx.notify();
         Some(server)
+    }
+
+    pub(crate) fn record_buffer_access(&mut self, buffer_id: EntityId) {
+        self.recent_buffers.retain(|recent| *recent != buffer_id);
+        self.recent_buffers.insert(0, buffer_id);
+        self.recent_buffers.truncate(MAX_RECENT_BUFFERS);
+    }
+
+    pub(crate) fn recent_buffers(&self) -> &[EntityId] {
+        &self.recent_buffers
     }
 
     pub fn sign_in_url(&self) -> String {

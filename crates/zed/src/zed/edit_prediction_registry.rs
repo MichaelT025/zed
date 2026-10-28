@@ -257,7 +257,8 @@ fn assign_edit_prediction_provider(
         }
         Some(EditPredictionProviderConfig::Devin) => {
             let devin = Devin::global(cx);
-            let provider = cx.new(|_| DevinEditPredictionDelegate::new(devin));
+            let project = editor.project().map(|project| project.downgrade());
+            let provider = cx.new(|_| DevinEditPredictionDelegate::new(devin, project));
             editor.set_edit_prediction_provider(Some(provider), trigger, window, cx);
         }
         Some(EditPredictionProviderConfig::Zed(model)) => {

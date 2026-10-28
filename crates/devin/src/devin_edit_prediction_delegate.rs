@@ -5,21 +5,26 @@ use edit_prediction_types::{
     EditPrediction, EditPredictionDelegate, EditPredictionDiscardReason, EditPredictionIconSet,
     EditPredictionRequestTrigger, PredictedCursorPosition, interpolate_edits,
 };
-use gpui::{App, AppContext as _, Context, Entity, EntityId, SharedString, Task};
+use gpui::{App, AppContext as _, Context, Entity, EntityId, SharedString, Task, WeakEntity};
 use icons::IconName;
 use language::{Anchor, Buffer, BufferSnapshot, EditPreview, language_settings::LanguageSettings};
+use project::Project;
 use text::ToOffset as _;
 
 use crate::{
     Devin,
     protocol::{
-        Document, DocumentRange, EditorOptions, Position, SupercompleteTriggerCondition,
-        convert_diff, diff_targets_document, locate_new_offset,
+        Document, EditorOptions, SupercompleteTriggerCondition, convert_diff,
+        diff_targets_document, locate_new_offset,
     },
 };
 
+/// Devin's extension sends open documents as context up to this total size.
+const MAX_OTHER_DOCUMENTS_BYTES: usize = 1024 * 1024;
+
 pub struct DevinEditPredictionDelegate {
     devin: Entity<Devin>,
+    project: Option<WeakEntity<Project>>,
     pending_request: Option<Task<Result<()>>>,
     current_prediction: Option<CurrentPrediction>,
 }
@@ -41,12 +46,42 @@ impl CurrentPrediction {
 }
 
 impl DevinEditPredictionDelegate {
-    pub fn new(devin: Entity<Devin>) -> Self {
+    pub fn new(devin: Entity<Devin>, project: Option<WeakEntity<Project>>) -> Self {
         Self {
             devin,
+            project,
             pending_request: None,
             current_prediction: None,
         }
+    }
+
+    /// Collects the project's other open files, most recently used first, within the size budget.
+    fn other_document_sources(&self, buffer: &Entity<Buffer>, cx: &App) -> Vec<DocumentSource> {
+        let Some(project) = self.project.as_ref().and_then(|project| project.upgrade()) else {
+            return Vec::new();
+        };
+        let recent_buffers = self.devin.read(cx).recent_buffers();
+        let mut buffers = project.read(cx).opened_buffers(cx);
+        buffers.retain(|other| other.entity_id() != buffer.entity_id());
+        buffers.sort_by_key(|other| {
+            recent_buffers
+                .iter()
+                .position(|recent| *recent == other.entity_id())
+                .unwrap_or(usize::MAX)
+        });
+
+        let mut total_len = 0;
+        buffers
+            .iter()
+            .filter_map(|other| {
+                let source = DocumentSource::new(other.read(cx), cx)?;
+                let len = source.snapshot.len();
+                (total_len + len < MAX_OTHER_DOCUMENTS_BYTES).then(|| {
+                    total_len += len;
+                    source
+                })
+            })
+            .collect()
     }
 }
 
@@ -72,7 +107,7 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
             && buffer
                 .read(cx)
                 .file()
-                .is_some_and(|file| file.as_local().is_some())
+                .is_some_and(|file| file.as_local().is_some() && !file.is_private())
     }
 
     fn is_refreshing(&self, _cx: &App) -> bool {
@@ -95,15 +130,17 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
             return;
         }
 
-        let Some(document) = document_for_request(&buffer, &snapshot, cursor_position, cx) else {
+        let Some(source) = DocumentSource::new(buffer.read(cx), cx) else {
             return;
         };
-        let Some(server) = self
-            .devin
-            .update(cx, |devin, cx| devin.server(&document.workspace_uri, cx))
-        else {
+        let buffer_id = buffer.entity_id();
+        let Some(server) = self.devin.update(cx, |devin, cx| {
+            devin.record_buffer_access(buffer_id);
+            devin.server(&source.workspace_uri, cx)
+        }) else {
             return;
         };
+        let other_sources = self.other_document_sources(&buffer, cx);
         let editor_options = {
             let settings = LanguageSettings::for_buffer(buffer.read(cx), cx);
             EditorOptions {
@@ -119,7 +156,7 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
             }
             _ => SupercompleteTriggerCondition::CursorLineNavigation,
         };
-        let buffer_id = buffer.entity_id();
+        let cursor_offset = cursor_position.to_offset(&snapshot);
 
         self.pending_request = Some(cx.spawn(async move |this, cx| {
             if !debounce_duration.is_zero() {
@@ -128,13 +165,22 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
 
             let result = async {
                 let server = server.await.map_err(|error| anyhow!("{error}"))?;
-                let request_text = document.text.clone();
-                let document_uri = document.absolute_uri.clone();
-                let response = cx
+                let (document, response) = cx
                     .background_spawn(async move {
-                        server
-                            .complete(document, editor_options, trigger_condition)
-                            .await
+                        let document = source.into_document().with_cursor(cursor_offset);
+                        let other_documents = other_sources
+                            .into_iter()
+                            .map(DocumentSource::into_document)
+                            .collect();
+                        let response = server
+                            .complete(
+                                document.clone(),
+                                other_documents,
+                                editor_options,
+                                trigger_condition,
+                            )
+                            .await?;
+                        anyhow::Ok((document, response))
                     })
                     .await?;
 
@@ -150,14 +196,14 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
                     }
                     return Ok(None);
                 };
-                if !diff_targets_document(&diff.path, &document_uri) {
+                if !diff_targets_document(&diff.path, &document.absolute_uri) {
                     log::debug!(
                         "Devin suggested an edit in another file, which isn't supported yet"
                     );
                     return Ok(None);
                 }
                 let converted = cx
-                    .background_spawn(async move { convert_diff(&request_text, &diff) })
+                    .background_spawn(async move { convert_diff(&document.text, &diff) })
                     .await
                     .context("Devin returned a diff that doesn't match the buffer")?;
                 if converted.edits.is_empty() {
@@ -251,54 +297,60 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
     }
 }
 
-fn document_for_request(
-    buffer: &Entity<Buffer>,
-    snapshot: &BufferSnapshot,
-    cursor_position: Anchor,
-    cx: &App,
-) -> Option<Document> {
-    let buffer = buffer.read(cx);
-    let file = buffer.file()?;
-    let abs_path = file.as_local()?.abs_path(cx);
-    let worktree_root = worktree_root(&abs_path, file.path().components().count());
-    let absolute_uri = url::Url::from_file_path(&abs_path).ok()?.to_string();
-    let workspace_uri = url::Url::from_directory_path(&worktree_root)
-        .ok()?
-        .to_string();
+/// A buffer captured on the main thread, so that its text can be built in the background.
+struct DocumentSource {
+    snapshot: BufferSnapshot,
+    absolute_uri: String,
+    workspace_uri: String,
+    is_dirty: bool,
+}
 
-    let cursor_offset = cursor_position.to_offset(snapshot);
-    let cursor_point = snapshot.offset_to_point(cursor_offset);
-    let cursor = Position {
-        row: u64::from(cursor_point.row),
-        col: u64::from(cursor_point.column),
-    };
+impl DocumentSource {
+    /// Returns `None` for buffers that aren't local files, and for private files, which aren't
+    /// sent to Devin.
+    fn new(buffer: &Buffer, cx: &App) -> Option<Self> {
+        let file = buffer.file()?;
+        if file.is_private() {
+            return None;
+        }
+        let abs_path = file.as_local()?.abs_path(cx);
+        let worktree_root = worktree_root(&abs_path, file.path().components().count());
+        Some(Self {
+            snapshot: buffer.snapshot(),
+            absolute_uri: url::Url::from_file_path(&abs_path).ok()?.to_string(),
+            workspace_uri: url::Url::from_directory_path(&worktree_root)
+                .ok()?
+                .to_string(),
+            is_dirty: buffer.is_dirty(),
+        })
+    }
 
-    let language_id = snapshot
-        .language()
-        .map(|language| language.lsp_id())
-        .unwrap_or_default();
-    Some(Document {
-        absolute_uri,
-        workspace_uri,
-        // Zed buffers store LF line endings internally, so send the text and diff it in that
-        // form, rather than the line ending used on disk.
-        text: snapshot.text(),
-        editor_language: if language_id.is_empty() {
-            "plaintext".to_string()
-        } else {
-            editor_language_id(&language_id)
-        },
-        language: Some(language_enum(&language_id)),
-        cursor_offset: cursor_offset as u64,
-        cursor_position: Some(cursor.clone()),
-        selections: vec![DocumentRange {
-            start_position: cursor.clone(),
-            end_position: cursor,
-        }],
-        line_ending: "\n".into(),
-        is_dirty: buffer.is_dirty(),
-        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-    })
+    fn into_document(self) -> Document {
+        let language_id = self
+            .snapshot
+            .language()
+            .map(|language| language.lsp_id())
+            .unwrap_or_default();
+        Document {
+            absolute_uri: self.absolute_uri,
+            workspace_uri: self.workspace_uri,
+            // Zed buffers store LF line endings internally, so send the text and diff it in that
+            // form, rather than the line ending used on disk.
+            text: self.snapshot.text(),
+            editor_language: if language_id.is_empty() {
+                "plaintext".to_string()
+            } else {
+                editor_language_id(&language_id)
+            },
+            language: Some(language_enum(&language_id)),
+            cursor_offset: 0,
+            cursor_position: None,
+            selections: Vec::new(),
+            line_ending: "\n".into(),
+            is_dirty: self.is_dirty,
+            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        }
+    }
 }
 
 fn worktree_root(abs_path: &std::path::Path, relative_component_count: usize) -> PathBuf {
