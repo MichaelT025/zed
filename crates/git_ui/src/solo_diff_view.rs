@@ -261,7 +261,12 @@ impl SoloDiffView {
         cx.notify();
     }
 
-    fn matches(&self, repository: &Entity<Repository>, repo_path: &RepoPath, cx: &App) -> bool {
+    pub(crate) fn matches(
+        &self,
+        repository: &Entity<Repository>,
+        repo_path: &RepoPath,
+        cx: &App,
+    ) -> bool {
         self.repository_id == repository.read(cx).id && &self.repo_path == repo_path
     }
 
