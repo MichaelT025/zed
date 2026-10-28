@@ -861,9 +861,9 @@ pub enum GitPanelCommitEditor {
 #[serde(rename_all = "snake_case")]
 pub enum GitPanelClickBehavior {
     /// Open the project diff, showing all changed files.
-    #[default]
     ProjectDiff,
     /// Open a single-file diff view.
+    #[default]
     FileDiff,
     /// Open the file in the editor without a diff view.
     ViewFile,
