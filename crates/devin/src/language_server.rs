@@ -7,7 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -27,8 +27,8 @@ use crate::protocol::{
     Document, EXTENSION_SERVER_SERVICE, EditorOptions, GetUserStatusResponse,
     HandleStreamingTabV2Request, HandleStreamingTabV2Response, IdeAction, LANGUAGE_SERVER_SERVICE,
     Metadata, MetadataRequest, ProtobufValue, ProvideCompletionFeedbackRequest, ProviderSource,
-    RefreshContextForIdeActionRequest, SupercompleteTriggerCondition, decode_protobuf_fields, encode_native_values_response,
-    encode_set_native_value_response, parse_language_server_started,
+    RefreshContextForIdeActionRequest, SupercompleteTriggerCondition, decode_protobuf_fields,
+    encode_native_values_response, encode_set_native_value_response, parse_language_server_started,
 };
 
 pub const API_SERVER_URL: &str = "https://server.codeium.com";
@@ -411,9 +411,37 @@ impl DevinLanguageServer {
             disable_tab_jump: false,
             supercomplete_aggression: "SUPERCOMPLETE_AGGRESSION_MEDIUM",
         };
-        self.rpc
+        let started_at = Instant::now();
+        let result: Result<HandleStreamingTabV2Response> = self
+            .rpc
             .call("HandleStreamingTabV2", &request, RPC_TIMEOUT)
-            .await
+            .await;
+        let elapsed_ms = started_at.elapsed().as_millis();
+        match &result {
+            Ok(response) => {
+                if response.diff.is_some() {
+                    log::debug!(
+                        "Devin completion request ({trigger:?}) returned an edit in {elapsed_ms}ms"
+                    );
+                } else if response.tab_jump.is_some() {
+                    log::debug!(
+                        "Devin completion request ({trigger:?}) returned a jump in {elapsed_ms}ms"
+                    );
+                } else {
+                    log::debug!(
+                        "Devin completion request ({trigger:?}) returned nothing in {elapsed_ms}ms (stop reason: {:?}, filter reason: {:?})",
+                        response.stop_reason,
+                        response.filter_reason
+                    );
+                }
+            }
+            Err(error) => {
+                log::debug!(
+                    "Devin completion request ({trigger:?}) failed after {elapsed_ms}ms: {error:#}"
+                );
+            }
+        }
+        result
     }
 
     /// Reports whether a shown completion was accepted. Recent feedback is part of the model's
