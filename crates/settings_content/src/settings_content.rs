@@ -789,7 +789,7 @@ pub struct GitPanelSettingsContent {
 
     /// How to group entries in the git panel.
     ///
-    /// Default: status
+    /// Default: staging
     pub group_by: Option<GitPanelGroupBy>,
 
     /// Whether to collapse untracked files in the diff panel.
@@ -958,8 +958,8 @@ pub enum GitPanelSortBy {
 #[serde(rename_all = "snake_case")]
 pub enum GitPanelGroupBy {
     None,
-    #[default]
     Status,
+    #[default]
     Staging,
 }
 
