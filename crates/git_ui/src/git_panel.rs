@@ -106,7 +106,8 @@ use workspace::SERIALIZATION_THROTTLE_TIME;
 use workspace::{
     Item, ModalView, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
-    notifications::{DetachAndPromptErr, NotificationId, NotifyTaskExt},
+    notifications::{DetachAndPromptErr, NotificationId, NotifyResultExt, NotifyTaskExt},
+    pane::SaveIntent,
 };
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
@@ -635,6 +636,13 @@ impl HistoryLayout {
         self.pending = false;
         self.awaiting_first_commits = false;
     }
+}
+
+/// A single-file diff opened by a click that may turn out to be the first half of a
+/// double-click, which opens the project diff instead.
+struct ClickOpenedSoloDiff {
+    view: Option<WeakEntity<SoloDiffView>>,
+    _task: Task<()>,
 }
 
 struct HistoryBaseRefFetch {
@@ -1311,6 +1319,7 @@ pub struct GitPanel {
     /// The loaded history no longer matches the repository; refresh on next view.
     history_stale: bool,
     history_ref_picker_handle: PopoverMenuHandle<HistoryRefPicker>,
+    click_opened_solo_diff: Option<ClickOpenedSoloDiff>,
     _commit_message_buffer_subscription: Option<Subscription>,
     _repo_subscriptions: Vec<Subscription>,
     _settings_subscription: Subscription,
@@ -1652,6 +1661,7 @@ impl GitPanel {
                 history_refresh_restart: false,
                 history_stale: false,
                 history_ref_picker_handle: PopoverMenuHandle::default(),
+                click_opened_solo_diff: None,
                 _commit_message_buffer_subscription: None,
                 _repo_subscriptions: Vec::new(),
                 _settings_subscription,
@@ -2908,8 +2918,14 @@ impl GitPanel {
         };
         match action {
             GitPanelClickBehavior::ProjectDiff => {
+                if secondary {
+                    self.close_click_opened_solo_diff(window, cx);
+                }
                 self.open_diff(&Default::default(), window, cx);
                 self.focus_handle.focus(window, cx);
+            }
+            GitPanelClickBehavior::FileDiff if !secondary => {
+                self.open_solo_diff_on_click(window, cx);
             }
             GitPanelClickBehavior::FileDiff => {
                 self.open_solo_diff(&Default::default(), window, cx);
@@ -2918,6 +2934,71 @@ impl GitPanel {
                 self.view_file(&Default::default(), window, cx);
             }
         }
+    }
+
+    fn open_solo_diff_on_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.click_opened_solo_diff = None;
+        let Some(repository) = self.active_repository.clone() else {
+            return;
+        };
+        let Some(entry) = self.effective_status_entries().into_iter().next() else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let already_open = workspace
+            .read(cx)
+            .items_of_type::<SoloDiffView>(cx)
+            .any(|view| view.read(cx).matches(&repository, &entry.repo_path, cx));
+        let open_task =
+            SoloDiffView::open_or_focus(entry, repository, self.workspace.clone(), window, cx);
+        if already_open {
+            open_task.detach_and_notify_err(self.workspace.clone(), window, cx);
+            return;
+        }
+
+        let workspace = self.workspace.clone();
+        let task = cx.spawn(async move |git_panel, cx| {
+            let Some(view) = open_task.await.notify_workspace_async_err(workspace, cx) else {
+                return;
+            };
+            git_panel
+                .update(cx, |git_panel, _| {
+                    if let Some(click_opened_solo_diff) = git_panel.click_opened_solo_diff.as_mut()
+                    {
+                        click_opened_solo_diff.view = Some(view.downgrade());
+                    }
+                })
+                .ok();
+        });
+        self.click_opened_solo_diff = Some(ClickOpenedSoloDiff {
+            view: None,
+            _task: task,
+        });
+    }
+
+    /// Dropping the record cancels an open that is still loading; a view that already
+    /// opened is closed so the double-click leaves only the project diff.
+    fn close_click_opened_solo_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(click_opened_solo_diff) = self.click_opened_solo_diff.take() else {
+            return;
+        };
+        let Some(view) = click_opened_solo_diff.view.and_then(|view| view.upgrade()) else {
+            return;
+        };
+        let Some(pane) = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).pane_for(&view))
+        else {
+            return;
+        };
+        pane.update(cx, |pane, cx| {
+            pane.close_item_by_id(view.entity_id(), SaveIntent::Skip, window, cx)
+        })
+        .detach_and_log_err(cx);
     }
 
     fn revert_selected(
@@ -11499,6 +11580,64 @@ mod tests {
         cx.run_until_parked();
 
         assert_editor_opened_with_path(&workspace, Path::new("src/a/foo.rs"), &mut cx);
+    }
+
+    #[gpui::test]
+    async fn test_double_click_replaces_solo_diff_with_project_diff(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_, _, workspace, panel, mut cx) = setup_git_panel_with_changes(
+            cx,
+            json!({
+                ".git": {},
+                "a.txt": "a",
+                "b.txt": "b",
+            }),
+            &[
+                ("a.txt", StatusCode::Modified),
+                ("b.txt", StatusCode::Modified),
+            ],
+        )
+        .await;
+
+        let click = |panel: &Entity<GitPanel>,
+                     name: &str,
+                     double_click: bool,
+                     cx: &mut VisualTestContext| {
+            panel.update_in(cx, |panel, window, cx| {
+                let index = entry_index_for_repo_path(panel, &repo_path(name))
+                    .expect("entry should be listed");
+                panel.clear_marks_and_select(index, cx);
+                panel.open_selected_entry_on_click(double_click, window, cx);
+            });
+            cx.run_until_parked();
+        };
+
+        click(&panel, "a.txt", false, &mut cx);
+        workspace.read_with(&cx, |workspace, cx| {
+            assert_eq!(workspace.items_of_type::<SoloDiffView>(cx).count(), 1);
+            assert_eq!(workspace.items_of_type::<ProjectDiff>(cx).count(), 0);
+        });
+
+        click(&panel, "b.txt", false, &mut cx);
+        click(&panel, "b.txt", true, &mut cx);
+        workspace.read_with(&cx, |workspace, cx| {
+            assert_eq!(
+                workspace.items_of_type::<SoloDiffView>(cx).count(),
+                1,
+                "the double-click should close only the diff its first click opened"
+            );
+            assert_eq!(workspace.items_of_type::<ProjectDiff>(cx).count(), 1);
+        });
+
+        click(&panel, "a.txt", false, &mut cx);
+        click(&panel, "a.txt", true, &mut cx);
+        workspace.read_with(&cx, |workspace, cx| {
+            assert_eq!(
+                workspace.items_of_type::<SoloDiffView>(cx).count(),
+                1,
+                "a diff that was already open before the double-click should stay open"
+            );
+        });
     }
 
     #[gpui::test]
