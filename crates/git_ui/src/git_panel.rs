@@ -37,8 +37,9 @@ use git::Oid;
 use git::commit::ParsedCommitMessage;
 use git::repository::{
     Branch, CommitData, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions,
-    GitCommitTemplate, GitCommitter, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
-    ResetMode, Upstream, UpstreamTracking, UpstreamTrackingStatus, get_git_committer,
+    GitCommitTemplate, GitCommitter, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
+    Remote, RemoteCommandOutput, ResetMode, Upstream, UpstreamTracking, UpstreamTrackingStatus,
+    get_git_committer,
 };
 use git::stash::GitStash;
 use git::status::{DiffStat, StageStatus};
@@ -71,7 +72,8 @@ use project::git_store::GitAccess;
 use project::{
     Fs, Project, ProjectPath,
     git_store::{
-        CommitDataState, GitStoreEvent, Repository, RepositoryEvent, RepositoryId, pending_op,
+        CommitDataState, GitGraphEvent, GitStoreEvent, Repository, RepositoryEvent, RepositoryId,
+        pending_op,
     },
     project_settings::{GitPathStyle, ProjectSettings},
 };
@@ -114,6 +116,8 @@ use zed_actions::{
 
 const GIT_PANEL_KEY: &str = "GitPanel";
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
+/// Minimum spacing between History graph layouts while the log is still loading.
+const HISTORY_LAYOUT_THROTTLE: Duration = Duration::from_millis(250);
 const RECENT_COMMIT_COUNT: usize = 3;
 // TODO: We should revise this part. It seems the indentation width is not aligned with the one in project panel
 const TREE_INDENT: f32 = 16.0;
@@ -579,6 +583,24 @@ enum GitPanelTab {
     History,
 }
 
+fn commit_history_tags_by_sha(
+    commits: &[Arc<InitialGraphCommitData>],
+) -> HashMap<Oid, Vec<SharedString>> {
+    commits
+        .iter()
+        .map(|commit| {
+            (
+                commit.sha,
+                commit
+                    .tag_names()
+                    .into_iter()
+                    .map(|tag_name| SharedString::from(tag_name.to_string()))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 enum CommitHistory {
     Loading,
@@ -586,6 +608,50 @@ enum CommitHistory {
     /// An empty list means the repository has no commits.
     Loaded(Rc<[CommitHistoryEntry]>),
     Error(SharedString),
+}
+
+/// Coalesces History graph layouts so chunked log fetches do not each pay for a
+/// full relayout.
+#[derive(Default)]
+struct HistoryLayout {
+    _task: Option<Task<()>>,
+    /// The `(log_source, log_order)` the in-flight layout was built for.
+    key: Option<(LogSource, LogOrder)>,
+    generation: u64,
+    in_flight: bool,
+    pending: bool,
+    /// The in-flight task is sleeping out the throttle after a layout that found no
+    /// commits yet, so the first chunk can interrupt it instead of waiting.
+    awaiting_first_commits: bool,
+}
+
+impl HistoryLayout {
+    /// Drops the in-flight layout and makes any result it still produces stale.
+    fn cancel(&mut self) {
+        self._task = None;
+        self.key = None;
+        self.generation = self.generation.wrapping_add(1);
+        self.in_flight = false;
+        self.pending = false;
+        self.awaiting_first_commits = false;
+    }
+}
+
+struct HistoryBaseRefFetch {
+    repository_id: RepositoryId,
+    _task: Task<()>,
+}
+
+struct HistoryLayoutSnapshot {
+    commits: Vec<Arc<InitialGraphCommitData>>,
+    is_loading: bool,
+    error: Option<SharedString>,
+}
+
+enum HistoryLayoutStep {
+    Done,
+    RunNow,
+    Wait(Duration),
 }
 
 /// Discarding only unstaged changes leaves the index alone, so such an op says
@@ -1233,10 +1299,17 @@ pub struct GitPanel {
     commit_history: CommitHistory,
     focused_history_entry: Option<usize>,
     history_ref_filter: HistoryRefFilter,
-    history_base_ref: Option<SharedString>,
-    history_base_ref_task: Option<Task<()>>,
+    /// Keyed by repository so switching back and forth does not refetch the base.
+    history_base_refs: HashMap<RepositoryId, Option<SharedString>>,
+    history_base_ref_fetch: Option<HistoryBaseRefFetch>,
     hovered_history_entry: Option<usize>,
-    history_layout_task: Option<Task<()>>,
+    history_layout: HistoryLayout,
+    /// A refresh is already queued for the next tick.
+    history_refresh_scheduled: bool,
+    /// The queued refresh must discard any in-flight layout.
+    history_refresh_restart: bool,
+    /// The loaded history no longer matches the repository; refresh on next view.
+    history_stale: bool,
     history_ref_picker_handle: PopoverMenuHandle<HistoryRefPicker>,
     _commit_message_buffer_subscription: Option<Subscription>,
     _repo_subscriptions: Vec<Subscription>,
@@ -1571,10 +1644,13 @@ impl GitPanel {
                 commit_history: CommitHistory::Loading,
                 focused_history_entry: None,
                 history_ref_filter: HistoryRefFilter::default(),
-                history_base_ref: None,
-                history_base_ref_task: None,
+                history_base_refs: HashMap::default(),
+                history_base_ref_fetch: None,
                 hovered_history_entry: None,
-                history_layout_task: None,
+                history_layout: HistoryLayout::default(),
+                history_refresh_scheduled: false,
+                history_refresh_restart: false,
+                history_stale: false,
                 history_ref_picker_handle: PopoverMenuHandle::default(),
                 _commit_message_buffer_subscription: None,
                 _repo_subscriptions: Vec::new(),
@@ -5569,17 +5645,18 @@ impl GitPanel {
             self.git_access = None;
             self._repo_subscriptions.clear();
             self.history_ref_filter = HistoryRefFilter::default();
-            self.history_base_ref = None;
-            self.history_base_ref_task = None;
-            self.history_layout_task = None;
-            if self.active_tab == GitPanelTab::History {
-                self.set_commit_history(CommitHistory::Loading, cx);
-            }
+            self.history_base_ref_fetch = None;
+            self.history_layout.cancel();
+            self.history_stale = true;
+            self.set_commit_history(CommitHistory::Loading, cx);
         }
         self.active_repository = new_active_repository;
         self.reopen_commit_buffer(window, cx);
         self.preload_commit_history(cx);
-        if self.active_tab == GitPanelTab::History {
+        if self.active_tab == GitPanelTab::History
+            && matches!(self.commit_history, CommitHistory::Loading)
+            && !self.history_layout.in_flight
+        {
             self.load_commit_history(cx);
         }
         self.update_visible_entries_task = cx.spawn_in(window, async move |_, cx| {
@@ -7533,7 +7610,7 @@ impl GitPanel {
                 git_panel
                     .update(cx, |git_panel, cx| {
                         git_panel.history_ref_filter = filter.clone();
-                        git_panel.fetch_commit_history_entries(cx);
+                        git_panel.refresh_commit_history(true, cx);
                         cx.notify();
                     })
                     .log_err();
@@ -7784,40 +7861,14 @@ impl GitPanel {
         }
         self.active_tab = tab;
         self.activation_focus_handle(cx).focus(window, cx);
-        match tab {
-            GitPanelTab::History => {
-                self.load_commit_history(cx);
-            }
-            GitPanelTab::Changes => {
-                self.set_commit_history(CommitHistory::Loading, cx);
-                self._repo_subscriptions.clear();
-            }
+        if tab == GitPanelTab::History {
+            self.load_commit_history(cx);
         }
         cx.notify();
     }
 
-    fn preload_commit_history(&mut self, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.as_ref() else {
-            return;
-        };
-
-        let Some((log_source, _)) = Self::commit_history_log_source(
-            active_repository,
-            &self.history_ref_filter,
-            self.history_base_ref.as_ref(),
-            cx,
-        ) else {
-            return;
-        };
-        let log_order = LogOrder::TopoOrder;
-
-        // Kick off the git log fetch so data is ready when the user switches to History.
-        // graph_data() is idempotent — if already loading/loaded, this is a no-op.
-        active_repository.update(cx, |repository, cx| {
-            repository.graph_data(log_source, log_order, 0..0, cx);
-        });
-    }
-
+    /// Subscribes to the active repository and loads the History graph, unless a
+    /// still-fresh graph is already loaded.
     fn load_commit_history(&mut self, cx: &mut Context<Self>) {
         let Some(active_repository) = self.active_repository.clone() else {
             return;
@@ -7826,15 +7877,8 @@ impl GitPanel {
         if self._repo_subscriptions.is_empty() {
             self._repo_subscriptions.push(cx.subscribe(
                 &active_repository,
-                |this, _repo, event, cx| {
-                    if matches!(
-                        event,
-                        RepositoryEvent::GraphEvent(_, _) | RepositoryEvent::TagsChanged
-                    ) {
-                        if this.active_tab == GitPanelTab::History {
-                            this.fetch_commit_history_entries(cx);
-                        }
-                    }
+                |this, _repository, event, cx| {
+                    this.handle_repository_event(event, cx);
                 },
             ));
             self._repo_subscriptions
@@ -7843,108 +7887,396 @@ impl GitPanel {
                 }));
         }
 
-        self.fetch_history_base_ref(cx);
-        self.fetch_commit_history_entries(cx);
+        if self.history_stale || !matches!(self.commit_history, CommitHistory::Loaded(_)) {
+            self.refresh_commit_history(false, cx);
+        }
     }
 
-    fn fetch_history_base_ref(&mut self, cx: &mut Context<Self>) {
-        if self.history_base_ref.is_some() || self.history_base_ref_task.is_some() {
+    fn handle_repository_event(&mut self, event: &RepositoryEvent, cx: &mut Context<Self>) {
+        match event {
+            RepositoryEvent::GraphEvent(key, graph_event) => {
+                if Some(key) != self.current_history_key(cx).as_ref() {
+                    return;
+                }
+                if self.active_tab != GitPanelTab::History {
+                    self.history_stale = true;
+                    return;
+                }
+                match graph_event {
+                    // The final layout must not wait out the loading throttle.
+                    GitGraphEvent::FullyLoaded | GitGraphEvent::LoadingError => {
+                        self.refresh_commit_history(true, cx);
+                    }
+                    GitGraphEvent::CountUpdated(_) => {
+                        self.refresh_commit_history(false, cx);
+                    }
+                }
+            }
+            // The repository clears its graph cache for these without emitting a
+            // `GraphEvent`, so the data has to be requested again once the cache
+            // is gone.
+            RepositoryEvent::HeadChanged => {
+                self.refresh_history_next_tick(true, cx);
+            }
+            RepositoryEvent::BranchListChanged | RepositoryEvent::TagsChanged => {
+                self.refresh_history_next_tick(false, cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// Defers the refresh by a tick so the repository's own subscriber has had a
+    /// chance to drop its graph cache for the repository event that triggered it.
+    fn refresh_history_next_tick(&mut self, restart: bool, cx: &mut Context<Self>) {
+        if self.active_tab != GitPanelTab::History {
+            self.history_stale = true;
+            return;
+        }
+        self.history_refresh_restart |= restart;
+        if self.history_refresh_scheduled {
+            return;
+        }
+        self.history_refresh_scheduled = true;
+
+        let handle = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            handle
+                .update(cx, |git_panel, cx| {
+                    let restart = std::mem::take(&mut git_panel.history_refresh_restart);
+                    git_panel.history_refresh_scheduled = false;
+                    git_panel.refresh_commit_history(restart, cx);
+                })
+                .log_err();
+        })
+        .detach();
+    }
+
+    fn current_history_key(&self, cx: &App) -> Option<(LogSource, LogOrder)> {
+        let active_repository = self.active_repository.as_ref()?;
+        let repository_id = active_repository.read(cx).id;
+        let (log_source, _) = Self::commit_history_log_source(
+            active_repository,
+            &self.history_ref_filter,
+            self.history_base_ref(repository_id),
+            cx,
+        )?;
+        Some((log_source, LogOrder::TopoOrder))
+    }
+
+    fn history_base_ref(&self, repository_id: RepositoryId) -> Option<&SharedString> {
+        self.history_base_refs.get(&repository_id)?.as_ref()
+    }
+
+    /// Returns whether the log source can be built yet. `Auto` includes the
+    /// repository's base ref, which is fetched asynchronously on first use.
+    fn ensure_history_base_ref(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.history_ref_filter != HistoryRefFilter::Auto {
+            return true;
+        }
+        let Some(active_repository) = self.active_repository.clone() else {
+            return false;
+        };
+        let repository_id = active_repository.read(cx).id;
+        if self.history_base_refs.contains_key(&repository_id) {
+            return true;
+        }
+        self.fetch_history_base_ref(repository_id, cx);
+        false
+    }
+
+    fn preload_commit_history(&mut self, cx: &mut Context<Self>) {
+        let Some(active_repository) = self.active_repository.clone() else {
+            return;
+        };
+        if !self.ensure_history_base_ref(cx) {
+            return;
+        }
+
+        let repository_id = active_repository.read(cx).id;
+        let Some((log_source, _)) = Self::commit_history_log_source(
+            &active_repository,
+            &self.history_ref_filter,
+            self.history_base_ref(repository_id),
+            cx,
+        ) else {
+            return;
+        };
+
+        // Kick off the git log fetch so data is ready when the user switches to History.
+        // graph_data() is idempotent — if already loading/loaded, this is a no-op.
+        active_repository.update(cx, |repository, cx| {
+            repository.graph_data(log_source, LogOrder::TopoOrder, 0..0, cx);
+        });
+    }
+
+    fn fetch_history_base_ref(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        if self
+            .history_base_ref_fetch
+            .as_ref()
+            .is_some_and(|fetch| fetch.repository_id == repository_id)
+        {
             return;
         }
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
+        if active_repository.read(cx).id != repository_id {
+            return;
+        }
 
         let default_branch_receiver =
             active_repository.update(cx, |repository, _| repository.default_branch(true));
-        self.history_base_ref_task = Some(cx.spawn(async move |git_panel, cx| {
+        let task = cx.spawn(async move |git_panel, cx| {
             let default_branch = match default_branch_receiver.await {
                 Ok(default_branch) => default_branch,
                 Err(Canceled) => Err(anyhow::anyhow!("default branch request was canceled")),
             };
 
             git_panel
-                .update(cx, |git_panel, cx| match default_branch {
-                    Ok(default_branch) => {
-                        git_panel.history_base_ref = default_branch;
-                        git_panel.fetch_commit_history_entries(cx);
-                    }
-                    Err(error) => log::error!("failed to load the default branch: {error}"),
+                .update(cx, |git_panel, cx| {
+                    git_panel.finish_history_base_ref(repository_id, default_branch, cx);
                 })
                 .log_err();
-        }));
+        });
+        self.history_base_ref_fetch = Some(HistoryBaseRefFetch {
+            repository_id,
+            _task: task,
+        });
     }
 
-    fn fetch_commit_history_entries(&mut self, cx: &mut Context<Self>) {
+    fn finish_history_base_ref(
+        &mut self,
+        repository_id: RepositoryId,
+        default_branch: anyhow::Result<Option<SharedString>>,
+        cx: &mut Context<Self>,
+    ) {
+        let base_ref = match default_branch {
+            Ok(base_ref) => base_ref,
+            Err(error) => {
+                log::error!("failed to load the default branch: {error}");
+                None
+            }
+        };
+        // Cached even on failure so a repository without a resolvable default
+        // branch is not asked again on every refresh.
+        self.history_base_refs.insert(repository_id, base_ref);
+
+        let active_repository_is_resolved = self
+            .active_repository
+            .as_ref()
+            .is_some_and(|repository| repository.read(cx).id == repository_id);
+        if !active_repository_is_resolved {
+            return;
+        }
+        if self.active_tab == GitPanelTab::History {
+            self.refresh_commit_history(true, cx);
+        } else {
+            self.preload_commit_history(cx);
+        }
+    }
+
+    /// Rebuilds the History graph for the current filter. With `restart`, an
+    /// in-flight layout for the same key is dropped, so new refs apply at once.
+    fn refresh_commit_history(&mut self, restart: bool, cx: &mut Context<Self>) {
+        if self.active_tab != GitPanelTab::History {
+            self.history_stale = true;
+            return;
+        }
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
+        if !self.ensure_history_base_ref(cx) {
+            // The base ref fetch refreshes once it resolves.
+            return;
+        }
 
+        let repository_id = active_repository.read(cx).id;
         let Some((log_source, graph_refs)) = Self::commit_history_log_source(
             &active_repository,
             &self.history_ref_filter,
-            self.history_base_ref.as_ref(),
+            self.history_base_ref(repository_id),
             cx,
         ) else {
             // No HEAD commit at all (unborn/empty repository).
+            self.history_layout.cancel();
+            self.history_stale = false;
             self.set_commit_history(CommitHistory::Loaded(Rc::from([])), cx);
             return;
         };
-        let log_order = LogOrder::TopoOrder;
+        let key = (log_source, LogOrder::TopoOrder);
 
-        let (commits, tag_names_by_sha, is_loading, error) =
-            active_repository.update(cx, |repository, cx| {
-                let response = repository.graph_data(log_source, log_order, 0..usize::MAX, cx);
-                let commits = response.commits.to_vec();
-                let tag_names_by_sha = commits
-                    .iter()
-                    .map(|commit| {
-                        (
-                            commit.sha,
-                            commit
-                                .tag_names()
-                                .into_iter()
-                                .map(|tag_name| SharedString::from(tag_name.to_string()))
-                                .collect::<Vec<_>>(),
-                        )
+        if self.history_layout.in_flight {
+            if self.history_layout.key.as_ref() == Some(&key)
+                && !restart
+                && !self.history_layout.awaiting_first_commits
+            {
+                self.history_layout.pending = true;
+                return;
+            }
+            self.history_layout.cancel();
+        }
+
+        self.start_history_layout(key, graph_refs, cx);
+    }
+
+    fn start_history_layout(
+        &mut self,
+        key: (LogSource, LogOrder),
+        graph_refs: GraphRefs,
+        cx: &mut Context<Self>,
+    ) {
+        self.history_layout.cancel();
+        let generation = self.history_layout.generation;
+        self.history_layout.key = Some(key.clone());
+        self.history_layout.in_flight = true;
+        self.history_stale = false;
+
+        let layout_key = key;
+        let task = cx.spawn(async move |git_panel, cx| {
+            let mut wait_before_layout = Duration::ZERO;
+            let mut last_signature: Option<(usize, bool, bool)> = None;
+            loop {
+                if !wait_before_layout.is_zero() {
+                    cx.background_executor().timer(wait_before_layout).await;
+                }
+
+                let Some(snapshot) = git_panel
+                    .update(cx, |git_panel, cx| {
+                        git_panel.take_history_layout_snapshot(generation, &layout_key, cx)
                     })
-                    .collect::<HashMap<Oid, Vec<SharedString>>>();
-                (
+                    .log_err()
+                    .flatten()
+                else {
+                    break;
+                };
+                let HistoryLayoutSnapshot {
                     commits,
-                    tag_names_by_sha,
-                    response.is_loading,
-                    response.error,
-                )
-            });
+                    is_loading,
+                    error,
+                } = snapshot;
 
-        self.history_layout_task = Some(cx.spawn(async move |git_panel, cx| {
-            let rows = cx
-                .background_spawn(async move { scm_graph::layout_graph(&commits, &graph_refs) })
-                .await;
+                // A layout is a pure function of the commits and refs, so an
+                // unchanged commit count cannot produce different rows.
+                let signature = (commits.len(), is_loading, error.is_some());
+                if last_signature.as_ref() == Some(&signature) {
+                    if !is_loading {
+                        git_panel
+                            .update(cx, |git_panel, _| {
+                                git_panel.complete_history_layout(generation);
+                            })
+                            .log_err();
+                        break;
+                    }
+                    wait_before_layout = HISTORY_LAYOUT_THROTTLE;
+                    continue;
+                }
+                last_signature = Some(signature);
 
-            git_panel
-                .update(cx, |git_panel, cx| {
-                    let entries: Rc<[CommitHistoryEntry]> = rows
-                        .into_iter()
-                        .map(|row| {
-                            let tag_names = match row.id {
-                                GraphNodeId::Commit(sha) => {
-                                    tag_names_by_sha.get(&sha).cloned().unwrap_or_default()
-                                }
-                                GraphNodeId::IncomingChanges | GraphNodeId::OutgoingChanges => {
-                                    Vec::new()
-                                }
-                            };
-                            CommitHistoryEntry { row, tag_names }
-                        })
-                        .collect();
-                    git_panel.set_commit_history(
-                        commit_history_from_response(entries, is_loading, error),
-                        cx,
-                    );
-                })
-                .log_err();
-        }));
+                let layout_refs = graph_refs.clone();
+                let entries = cx
+                    .background_spawn(async move {
+                        let rows = scm_graph::layout_graph(&commits, &layout_refs);
+                        let tag_names_by_sha = commit_history_tags_by_sha(&commits);
+                        rows.into_iter()
+                            .map(|row| CommitHistoryEntry {
+                                tag_names: match row.id {
+                                    GraphNodeId::Commit(sha) => {
+                                        tag_names_by_sha.get(&sha).cloned().unwrap_or_default()
+                                    }
+                                    GraphNodeId::IncomingChanges | GraphNodeId::OutgoingChanges => {
+                                        Vec::new()
+                                    }
+                                },
+                                row,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await;
+
+                let Some(step) = git_panel
+                    .update(cx, |git_panel, cx| {
+                        git_panel.finish_history_layout(generation, entries, is_loading, error, cx)
+                    })
+                    .log_err()
+                    .flatten()
+                else {
+                    break;
+                };
+
+                match step {
+                    HistoryLayoutStep::Done => break,
+                    HistoryLayoutStep::RunNow => wait_before_layout = Duration::ZERO,
+                    HistoryLayoutStep::Wait(duration) => wait_before_layout = duration,
+                }
+            }
+        });
+        self.history_layout._task = Some(task);
+    }
+
+    fn take_history_layout_snapshot(
+        &mut self,
+        generation: u64,
+        key: &(LogSource, LogOrder),
+        cx: &mut Context<Self>,
+    ) -> Option<HistoryLayoutSnapshot> {
+        if generation != self.history_layout.generation {
+            return None;
+        }
+        let active_repository = self.active_repository.clone()?;
+        let (commits, is_loading, error) = active_repository.update(cx, |repository, cx| {
+            let response = repository.graph_data(key.0.clone(), key.1, 0..usize::MAX, cx);
+            (
+                response.commits.to_vec(),
+                response.is_loading,
+                response.error,
+            )
+        });
+        self.history_layout.awaiting_first_commits = is_loading && commits.is_empty();
+        Some(HistoryLayoutSnapshot {
+            commits,
+            is_loading,
+            error,
+        })
+    }
+
+    fn finish_history_layout(
+        &mut self,
+        generation: u64,
+        entries: Vec<CommitHistoryEntry>,
+        is_loading: bool,
+        error: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> Option<HistoryLayoutStep> {
+        if generation != self.history_layout.generation {
+            return None;
+        }
+
+        let pending = std::mem::take(&mut self.history_layout.pending);
+        self.set_commit_history(
+            commit_history_from_response(Rc::from(entries), is_loading, error),
+            cx,
+        );
+
+        Some(if is_loading {
+            HistoryLayoutStep::Wait(HISTORY_LAYOUT_THROTTLE)
+        } else if pending {
+            HistoryLayoutStep::RunNow
+        } else {
+            self.complete_history_layout(generation);
+            HistoryLayoutStep::Done
+        })
+    }
+
+    /// Marks the layout for `generation` as finished so a later refresh starts a
+    /// new one instead of only queueing behind a layout that is already done.
+    fn complete_history_layout(&mut self, generation: u64) {
+        if generation != self.history_layout.generation {
+            return;
+        }
+        self.history_layout.in_flight = false;
+        self.history_layout.key = None;
+        self.history_layout.pending = false;
+        self.history_layout.awaiting_first_commits = false;
     }
 
     fn set_commit_history(&mut self, commit_history: CommitHistory, cx: &mut Context<Self>) {
@@ -10675,6 +11007,7 @@ mod tests {
     use serde_json::json;
     use settings::SettingsStore;
     use std::any::TypeId;
+    use std::cell::RefCell;
     use theme::LoadThemes;
     use util::path;
     use util::rel_path::rel_path;
@@ -11386,17 +11719,17 @@ mod tests {
         }
     }
 
-    async fn history_panel_for_project(
+    async fn history_panel_setup(
         fs: Arc<FakeFs>,
         cx: &mut TestAppContext,
-    ) -> Entity<GitPanel> {
+    ) -> (Entity<Project>, Entity<GitPanel>, VisualTestContext) {
         let project = Project::test(fs, [Path::new(path!("/root/project"))], cx).await;
         let window_handle =
             cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = window_handle
             .read_with(cx, |mw, _| mw.workspace().clone())
             .unwrap();
-        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
 
         cx.read(|cx| {
             project
@@ -11412,8 +11745,16 @@ mod tests {
         .await;
         cx.executor().run_until_parked();
 
-        let panel = workspace.update_in(cx, GitPanel::new);
-        panel.update_in(cx, |panel, window, cx| {
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        (project, panel, cx)
+    }
+
+    async fn history_panel_for_project(
+        fs: Arc<FakeFs>,
+        cx: &mut TestAppContext,
+    ) -> Entity<GitPanel> {
+        let (_, panel, mut cx) = history_panel_setup(fs, cx).await;
+        panel.update_in(&mut cx, |panel, window, cx| {
             panel.activate_history_tab(&ActivateHistoryTab, window, cx);
         });
         cx.run_until_parked();
@@ -11425,6 +11766,25 @@ mod tests {
             !matches!(panel.commit_history, CommitHistory::Loading)
         })
         .await;
+    }
+
+    /// Waits until the loaded history is final, including any coalesced relayout.
+    async fn wait_for_history_layout_to_settle(panel: &Entity<GitPanel>, cx: &mut TestAppContext) {
+        cx.condition(panel, |panel, _| {
+            !matches!(panel.commit_history, CommitHistory::Loading)
+                && !panel.history_layout.in_flight
+        })
+        .await;
+    }
+
+    fn loaded_history_entries(panel: &GitPanel) -> Rc<[CommitHistoryEntry]> {
+        let CommitHistory::Loaded(entries) = &panel.commit_history else {
+            panic!(
+                "expected a loaded history, found {:?}",
+                panel.commit_history
+            );
+        };
+        entries.clone()
     }
 
     #[gpui::test]
@@ -11536,6 +11896,182 @@ mod tests {
             assert_eq!(entries[1].row.output_swimlanes.len(), 1);
             assert_eq!(entries[2].row.input_swimlanes.len(), 1);
             assert!(entries[2].row.output_swimlanes.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_history_tab_keeps_entries_when_switching_tabs(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+
+        let dot_git = Path::new(path!("/root/project/.git"));
+        let first: Oid = "1111111111111111111111111111111111111111".parse().unwrap();
+        let second: Oid = "2222222222222222222222222222222222222222".parse().unwrap();
+        fs.set_branch_name(dot_git, Some("main"));
+        fs.with_git_state(dot_git, false, |state| {
+            state.refs.insert("HEAD".into(), second.to_string());
+            state.graph_commits = vec![
+                Arc::new(git::repository::InitialGraphCommitData {
+                    sha: second,
+                    parents: SmallVec::from_slice(&[first]),
+                    ref_names: Vec::new(),
+                }),
+                Arc::new(git::repository::InitialGraphCommitData {
+                    sha: first,
+                    parents: SmallVec::new(),
+                    ref_names: Vec::new(),
+                }),
+            ];
+        })
+        .unwrap();
+
+        let (_, panel, mut cx) = history_panel_setup(fs.clone(), cx).await;
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_history_tab(&ActivateHistoryTab, window, cx);
+        });
+        wait_for_history_layout_to_settle(&panel, &mut cx).await;
+
+        let entries_before = panel.read_with(&cx, |panel, _| loaded_history_entries(panel));
+        assert_eq!(entries_before.len(), 2);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_changes_tab(&ActivateChangesTab, window, cx);
+            assert!(
+                matches!(panel.commit_history, CommitHistory::Loaded(_)),
+                "switching to Changes must not discard the loaded history"
+            );
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert!(Rc::ptr_eq(&loaded_history_entries(panel), &entries_before));
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_history_tab(&ActivateHistoryTab, window, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert!(
+                Rc::ptr_eq(&loaded_history_entries(panel), &entries_before),
+                "returning to History must reuse the loaded entries"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_history_tab_auto_filter_logs_base_on_first_layout(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+
+        let dot_git = Path::new(path!("/root/project/.git"));
+        let sha: Oid = "0123456789012345678901234567890123456789".parse().unwrap();
+        fs.set_branch_name(dot_git, Some("main"));
+        fs.with_git_state(dot_git, false, |state| {
+            state.refs.insert("HEAD".into(), sha.to_string());
+            state.graph_commits = vec![Arc::new(git::repository::InitialGraphCommitData {
+                sha,
+                parents: SmallVec::new(),
+                ref_names: vec![SharedString::from("origin/main")],
+            })];
+        })
+        .unwrap();
+
+        let (project, panel, mut cx) = history_panel_setup(fs.clone(), cx).await;
+        let repository = cx
+            .read(|cx| project.read(cx).active_repository(cx))
+            .expect("the test repository should be active");
+        let log_sources = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|_, cx| {
+            let log_sources = log_sources.clone();
+            cx.subscribe(&repository, move |_, event: &RepositoryEvent, _| {
+                if let RepositoryEvent::GraphEvent(key, _) = event {
+                    log_sources.borrow_mut().push(key.clone());
+                }
+            })
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_history_tab(&ActivateHistoryTab, window, cx);
+        });
+        wait_for_history_layout_to_settle(&panel, &mut cx).await;
+
+        let log_sources = log_sources.borrow();
+        assert!(
+            !log_sources.is_empty(),
+            "the History tab should have requested a log for the repository"
+        );
+        for (log_source, log_order) in log_sources.iter() {
+            assert_eq!(*log_order, LogOrder::TopoOrder);
+            let LogSource::Refs(revisions) = log_source else {
+                panic!("Auto mode should log refs, found {log_source:?}");
+            };
+            assert!(
+                revisions
+                    .iter()
+                    .any(|revision| revision.as_ref() == "origin/main"),
+                "every Auto mode log should include the base ref, found {revisions:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_history_tab_ignores_graph_events_for_other_keys(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+
+        let dot_git = Path::new(path!("/root/project/.git"));
+        let first: Oid = "1111111111111111111111111111111111111111".parse().unwrap();
+        let second: Oid = "2222222222222222222222222222222222222222".parse().unwrap();
+        fs.set_branch_name(dot_git, Some("main"));
+        fs.with_git_state(dot_git, false, |state| {
+            state.refs.insert("HEAD".into(), second.to_string());
+            state.graph_commits = vec![
+                Arc::new(git::repository::InitialGraphCommitData {
+                    sha: second,
+                    parents: SmallVec::from_slice(&[first]),
+                    ref_names: Vec::new(),
+                }),
+                Arc::new(git::repository::InitialGraphCommitData {
+                    sha: first,
+                    parents: SmallVec::new(),
+                    ref_names: Vec::new(),
+                }),
+            ];
+        })
+        .unwrap();
+
+        let (project, panel, mut cx) = history_panel_setup(fs.clone(), cx).await;
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_history_tab(&ActivateHistoryTab, window, cx);
+        });
+        wait_for_history_layout_to_settle(&panel, &mut cx).await;
+
+        let entries_before = panel.read_with(&cx, |panel, _| loaded_history_entries(panel));
+        let generation_before = panel.read_with(&cx, |panel, _| panel.history_layout.generation);
+
+        let repository = cx
+            .read(|cx| project.read(cx).active_repository(cx))
+            .expect("the test repository should be active");
+        repository.update(&mut cx, |repository, cx| {
+            repository.graph_data(LogSource::All, LogOrder::DateOrder, 0..usize::MAX, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(panel.history_layout.generation, generation_before);
+            assert!(
+                Rc::ptr_eq(&loaded_history_entries(panel), &entries_before),
+                "a graph event for another log source must not reload the History graph"
+            );
         });
     }
 
