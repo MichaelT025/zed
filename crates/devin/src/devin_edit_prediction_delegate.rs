@@ -13,9 +13,10 @@ use text::ToOffset as _;
 
 use crate::{
     Devin,
+    language_server::DevinLanguageServer,
     protocol::{
-        Document, EditorOptions, SupercompleteTriggerCondition, convert_diff,
-        diff_targets_document, locate_new_offset,
+        Document, EditorOptions, SupercompleteDiff, SupercompleteTriggerCondition, convert_diff,
+        diff_targets_document, jump_offset, locate_new_offset,
     },
 };
 
@@ -36,6 +37,11 @@ struct CurrentPrediction {
     edits: Arc<[(Range<Anchor>, Arc<str>)]>,
     cursor_position: Option<PredictedCursorPosition>,
     edit_preview: EditPreview,
+}
+
+struct ResolvedCompletion {
+    completion_id: SharedString,
+    diff: SupercompleteDiff,
 }
 
 impl CurrentPrediction {
@@ -165,43 +171,37 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
 
             let result = async {
                 let server = server.await.map_err(|error| anyhow!("{error}"))?;
-                let (document, response) = cx
-                    .background_spawn(async move {
-                        let document = source.into_document().with_cursor(cursor_offset);
-                        let other_documents = other_sources
-                            .into_iter()
-                            .map(DocumentSource::into_document)
-                            .collect();
-                        let response = server
-                            .complete(
-                                document.clone(),
+                let resolved = cx
+                    .background_spawn({
+                        let server = server.clone();
+                        async move {
+                            let document = source.into_document().with_cursor(cursor_offset);
+                            let other_documents = other_sources
+                                .into_iter()
+                                .map(DocumentSource::into_document)
+                                .collect();
+                            let resolved = request_completion(
+                                &server,
+                                &document,
                                 other_documents,
                                 editor_options,
                                 trigger_condition,
                             )
                             .await?;
-                        anyhow::Ok((document, response))
+                            anyhow::Ok(resolved.map(|resolved| (document, resolved)))
+                        }
                     })
                     .await?;
-
-                let Some(diff) = response.diff else {
-                    if response.tab_jump.is_some() {
-                        log::debug!("Devin returned a jump suggestion, which isn't supported yet");
-                    } else {
-                        log::debug!(
-                            "Devin returned no edit (stop reason: {:?}, filter reason: {:?})",
-                            response.stop_reason,
-                            response.filter_reason
-                        );
-                    }
+                let Some((document, resolved)) = resolved else {
                     return Ok(None);
                 };
-                if !diff_targets_document(&diff.path, &document.absolute_uri) {
+                if !diff_targets_document(&resolved.diff.path, &document.absolute_uri) {
                     log::debug!(
                         "Devin suggested an edit in another file, which isn't supported yet"
                     );
                     return Ok(None);
                 }
+                let diff = resolved.diff;
                 let converted = cx
                     .background_spawn(async move { convert_diff(&document.text, &diff) })
                     .await
@@ -241,7 +241,7 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
 
                 anyhow::Ok(Some(CurrentPrediction {
                     buffer_id,
-                    completion_id: response.completion_id.into(),
+                    completion_id: resolved.completion_id,
                     snapshot,
                     edits,
                     cursor_position,
@@ -295,6 +295,64 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
             edit_preview: Some(current_prediction.edit_preview.clone()),
         })
     }
+}
+
+/// Requests a completion at the cursor. When Devin suggests jumping elsewhere in the document,
+/// this requests the edit at the jump target instead, because Zed shows edits away from the cursor
+/// behind its own jump affordance, while a bare jump within a file has no equivalent.
+async fn request_completion(
+    server: &DevinLanguageServer,
+    document: &Document,
+    other_documents: Vec<Document>,
+    editor_options: EditorOptions,
+    trigger: SupercompleteTriggerCondition,
+) -> Result<Option<ResolvedCompletion>> {
+    let mut response = server
+        .complete(
+            document.clone(),
+            other_documents.clone(),
+            editor_options.clone(),
+            trigger,
+        )
+        .await?;
+
+    if response.diff.is_none()
+        && let Some(jump) = response.tab_jump.take()
+    {
+        if !diff_targets_document(&jump.path, &document.absolute_uri) {
+            log::debug!("Devin suggested a jump to another file, which isn't supported yet");
+            return Ok(None);
+        }
+        let Some(jump_offset) = jump
+            .jump_position
+            .and_then(|position| jump_offset(&document.text, position))
+        else {
+            log::debug!("Devin suggested a jump outside the document");
+            return Ok(None);
+        };
+        response = server
+            .complete(
+                document.with_cursor(jump_offset),
+                other_documents,
+                editor_options,
+                SupercompleteTriggerCondition::CursorLineNavigation,
+            )
+            .await
+            .context("failed to request the edit at Devin's jump target")?;
+    }
+
+    let Some(diff) = response.diff else {
+        log::debug!(
+            "Devin returned no edit (stop reason: {:?}, filter reason: {:?})",
+            response.stop_reason,
+            response.filter_reason
+        );
+        return Ok(None);
+    };
+    Ok(Some(ResolvedCompletion {
+        completion_id: response.completion_id.into(),
+        diff,
+    }))
 }
 
 /// A buffer captured on the main thread, so that its text can be built in the background.

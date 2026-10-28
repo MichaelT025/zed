@@ -396,8 +396,7 @@ impl DevinLanguageServer {
             supercomplete_trigger_condition: trigger,
             other_documents,
             disable_supercomplete: false,
-            // Jump suggestions haven't been validated against Zed's jump handling yet.
-            disable_tab_jump: true,
+            disable_tab_jump: false,
             supercomplete_aggression: "SUPERCOMPLETE_AGGRESSION_MEDIUM",
         };
         self.rpc
