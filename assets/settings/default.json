@@ -1164,6 +1164,11 @@
     // Choices: expanded, collapsed
     // Default: expanded
     "commit_editor": "expanded",
+    // How the git panel arranges the changes list and the commit history.
+    //
+    // Choices: stacked, tabs
+    // Default: stacked
+    "layout": "stacked",
   },
   "agent": {
     // Whether the inline assistant should use streaming tools, when available

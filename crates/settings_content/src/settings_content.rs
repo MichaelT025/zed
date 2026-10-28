@@ -812,13 +812,18 @@ pub struct GitPanelSettingsContent {
 
     /// Default action when clicking a changed file in the Git panel.
     ///
-    /// Default: project_diff
+    /// Default: file_diff
     pub entry_primary_click_action: Option<GitPanelClickBehavior>,
 
     /// Whether the commit message editor is shown in the Git panel by default.
     ///
     /// Default: expanded
     pub commit_editor: Option<GitPanelCommitEditor>,
+
+    /// How the Git panel arranges the changes list and the commit history.
+    ///
+    /// Default: stacked
+    pub layout: Option<GitPanelLayout>,
 }
 
 #[derive(
@@ -842,6 +847,30 @@ pub enum GitPanelCommitEditor {
     Expanded,
     /// Hide the commit message editor, leaving only the commit button row.
     Collapsed,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Eq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GitPanelLayout {
+    /// Show the changes and the commit graph as collapsible, resizable sections
+    /// stacked in one view.
+    #[default]
+    Stacked,
+    /// Show the changes and the commit history as separate tabs.
+    Tabs,
 }
 
 #[derive(
