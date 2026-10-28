@@ -847,8 +847,8 @@ impl GitHeaderEntry {
             Section::Conflict => "Conflicts",
             Section::Tracked => "Tracked",
             Section::New => "Untracked",
-            Section::Staged => "Staged",
-            Section::Unstaged => "Unstaged",
+            Section::Staged => "Staged Changes",
+            Section::Unstaged => "Changes",
         }
     }
 }
@@ -6211,8 +6211,9 @@ impl GitPanel {
             ]
         };
 
-        // Keep Staged/Unstaged headers pinned even when empty (as long as there's
-        // anything to show at all) so the layout stays stable while staging.
+        // Like VS Code, the Staged section only appears once something is staged,
+        // while the Unstaged header stays pinned (as long as there's anything to
+        // show at all) so staging the last unstaged file doesn't hide its section.
         let has_any_section_entries = section_entries
             .iter()
             .any(|(_, entries)| !entries.is_empty());
@@ -6222,9 +6223,7 @@ impl GitPanel {
                 .map(|(section, entries)| (*section, entries.len())),
         );
         let show_when_empty = |section: Section| {
-            group_by_staging_state
-                && has_any_section_entries
-                && matches!(section, Section::Staged | Section::Unstaged)
+            group_by_staging_state && has_any_section_entries && section == Section::Unstaged
         };
 
         match &mut self.view_mode {
@@ -11912,6 +11911,14 @@ mod tests {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
+            // Most tests were written against the status grouping, so they pin it
+            // rather than following the staging default.
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().group_by =
+                        Some(GitPanelGroupBy::Status);
+                })
+            });
             theme_settings::init(LoadThemes::JustBase, cx);
             language_model::init(cx);
             editor::init(cx);
@@ -14064,10 +14071,6 @@ mod tests {
                         ..
                     }),
                     Header(GitHeaderEntry {
-                        header: Section::Staged
-                    }),
-                    EmptySection(Section::Staged),
-                    Header(GitHeaderEntry {
                         header: Section::Unstaged
                     }),
                     EmptySection(Section::Unstaged),
@@ -14097,10 +14100,6 @@ mod tests {
                         status: FileStatus::Unmerged(..),
                         ..
                     }),
-                    Header(GitHeaderEntry {
-                        header: Section::Staged
-                    }),
-                    EmptySection(Section::Staged),
                     Header(GitHeaderEntry {
                         header: Section::Unstaged
                     }),

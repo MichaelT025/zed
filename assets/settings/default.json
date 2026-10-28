@@ -1120,8 +1120,9 @@
     "sort_by": "path",
     // How to group entries in the git panel.
     //
-    // Default: status
-    "group_by": "status",
+    // Choices: none, status, staging
+    // Default: staging
+    "group_by": "staging",
     // Whether to collapse untracked files in the diff panel.
     //
     // Default: false

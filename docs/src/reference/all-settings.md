@@ -6189,7 +6189,7 @@ See the [debugger page](../debugger.md) for more information about debugging sup
     "folder_indicator": "icon",
     "fallback_branch_name": "main",
     "sort_by": "path",
-    "group_by": "status",
+    "group_by": "staging",
     "collapse_untracked_diff": false,
     "tree_view": false,
     "scrollbar": {
@@ -6215,7 +6215,7 @@ See the [debugger page](../debugger.md) for more information about debugging sup
 - `folder_indicator`: What to show for directories in the git panel. Can be `icon`, `chevron`, or `both`
 - `fallback_branch_name`: What branch name to use if `init.defaultBranch` is not set
 - `sort_by`: How to sort entries in the git panel. Can be `path` or `name`
-- `group_by`: How to group entries in the git panel. Can be `none` or `status`
+- `group_by`: How to group entries in the git panel. Can be `none`, `status` (tracked and untracked), or `staging` (staged and unstaged, like VS Code)
 - `collapse_untracked_diff`: Whether to collapse untracked files in the diff panel
 - `tree_view`: Whether to show entries in tree or flat view in the panel
 - `scrollbar`: When to show the scrollbar in the git panel

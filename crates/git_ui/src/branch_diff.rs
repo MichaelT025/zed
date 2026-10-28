@@ -916,7 +916,7 @@ mod tests {
     use gpui::TestAppContext;
     use project::FakeFs;
     use serde_json::json;
-    use settings::{DiffViewStyle, SettingsStore};
+    use settings::{DiffViewStyle, GitPanelGroupBy, SettingsStore};
     use std::path::Path;
     use std::sync::Arc;
     use unindent::Unindent as _;
@@ -935,6 +935,10 @@ mod tests {
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
                     settings.editor.diff_view_style = Some(DiffViewStyle::Unified);
+                    // These tests were written against the status grouping, so they pin it
+                    // rather than following the staging default.
+                    settings.git_panel.get_or_insert_default().group_by =
+                        Some(GitPanelGroupBy::Status);
                 });
             });
             theme_settings::init(theme::LoadThemes::JustBase, cx);
