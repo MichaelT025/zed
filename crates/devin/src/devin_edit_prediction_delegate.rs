@@ -799,7 +799,83 @@ fn language_enum(lsp_id: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::{collections::VecDeque, path::Path};
+
+    const ACTIVE_URI: &str = "file:///project/src/main.rs";
+    const OTHER_URI: &str = "file:///project/src/helper.rs";
+    const THIRD_URI: &str = "file:///project/src/lib.rs";
+    const ACTIVE_TEXT: &str = "one\ntwo\nthree\n";
+    const OTHER_TEXT: &str = "alpha\nbeta\ngamma\n";
+
+    struct FakeCompletionClient {
+        responses: parking_lot::Mutex<VecDeque<anyhow::Result<HandleStreamingTabV2Response>>>,
+        requests: parking_lot::Mutex<Vec<(Document, SupercompleteTriggerCondition)>>,
+    }
+
+    impl FakeCompletionClient {
+        fn new(responses: Vec<anyhow::Result<HandleStreamingTabV2Response>>) -> Self {
+            Self {
+                responses: parking_lot::Mutex::new(responses.into()),
+                requests: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CompletionClient for FakeCompletionClient {
+        fn complete(
+            &self,
+            document: Document,
+            _other_documents: Vec<Document>,
+            _editor_options: EditorOptions,
+            trigger: SupercompleteTriggerCondition,
+        ) -> impl Future<Output = anyhow::Result<HandleStreamingTabV2Response>> + Send {
+            self.requests.lock().push((document, trigger));
+            let response = self
+                .responses
+                .lock()
+                .pop_front()
+                .unwrap_or_else(|| Err(anyhow::anyhow!("no queued response")));
+            std::future::ready(response)
+        }
+    }
+
+    fn document(uri: &str, text: &str) -> Document {
+        Document {
+            absolute_uri: uri.to_string(),
+            workspace_uri: "file:///project/".to_string(),
+            text: text.to_string(),
+            editor_language: "rust".to_string(),
+            language: Some("LANGUAGE_RUST"),
+            cursor_offset: 0,
+            cursor_position: None,
+            selections: Vec::new(),
+            line_ending: "\n".to_string(),
+            is_dirty: false,
+            timestamp: String::new(),
+        }
+    }
+
+    fn response(json: serde_json::Value) -> HandleStreamingTabV2Response {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn request_suggestion_with(
+        client: &FakeCompletionClient,
+        document: &Document,
+        other_documents: &[Document],
+        trigger: SupercompleteTriggerCondition,
+    ) -> anyhow::Result<Option<Suggestion>> {
+        smol::block_on(request_suggestion(
+            client,
+            document,
+            other_documents,
+            EditorOptions {
+                tab_size: 4,
+                insert_spaces: true,
+            },
+            trigger,
+        ))
+    }
 
     #[test]
     fn test_worktree_root() {
@@ -809,5 +885,357 @@ mod tests {
             worktree_root(path, 0),
             Path::new("/projects/zed/crates/devin/src")
         );
+    }
+
+    #[test]
+    fn test_diff_in_active_document_produces_edit() {
+        let active = document(ACTIVE_URI, ACTIVE_TEXT).with_cursor(4);
+        let client = FakeCompletionClient::new(vec![Ok(response(serde_json::json!({
+            "completionId": "first",
+            "promptId": "prompt",
+            "diff": { "path": ACTIVE_URI }
+        })))]);
+
+        let suggestion =
+            request_suggestion_with(&client, &active, &[], SupercompleteTriggerCondition::Typing)
+                .unwrap();
+
+        let (target, completion, tab_jump, diff) = match suggestion {
+            Some(Suggestion::Edit {
+                target,
+                completion,
+                tab_jump,
+                diff,
+            }) => (target, completion, tab_jump, diff),
+            other => panic!("expected an edit suggestion, got {other:?}"),
+        };
+        assert_eq!(target, TargetDocument::Active);
+        assert_eq!(completion.completion_id.to_string(), "first");
+        assert_eq!(completion.prompt_id, "prompt");
+        assert!(tab_jump.is_none());
+        assert_eq!(diff.path, ACTIVE_URI);
+
+        let requests = client.requests.lock();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0.cursor_offset, 4);
+        assert_eq!(requests[0].1, SupercompleteTriggerCondition::Typing);
+    }
+
+    #[test]
+    fn test_diff_without_path_targets_active_document() {
+        let active = document(ACTIVE_URI, ACTIVE_TEXT);
+        let client = FakeCompletionClient::new(vec![Ok(response(serde_json::json!({
+            "completionId": "first",
+            "diff": {}
+        })))]);
+
+        let suggestion = request_suggestion_with(
+            &client,
+            &active,
+            &[document(OTHER_URI, OTHER_TEXT).with_cursor(3)],
+            SupercompleteTriggerCondition::Forced,
+        )
+        .unwrap();
+
+        match suggestion {
+            Some(Suggestion::Edit {
+                target,
+                completion,
+                tab_jump,
+                diff,
+            }) => {
+                assert_eq!(target, TargetDocument::Active);
+                assert_eq!(completion.completion_id.to_string(), "first");
+                assert!(tab_jump.is_none());
+                assert_eq!(diff.path, "");
+            }
+            other => panic!("expected an edit suggestion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_jump_within_active_document_requests_edit_at_jump_target() {
+        let active = document(ACTIVE_URI, ACTIVE_TEXT);
+        let client = FakeCompletionClient::new(vec![
+            Ok(response(serde_json::json!({
+                "completionId": "first",
+                "tabJump": {
+                    "path": ACTIVE_URI,
+                    "jumpPosition": { "row": "2", "col": "2" }
+                }
+            }))),
+            Ok(response(serde_json::json!({
+                "completionId": "second",
+                "diff": { "path": ACTIVE_URI }
+            }))),
+        ]);
+
+        let suggestion =
+            request_suggestion_with(&client, &active, &[], SupercompleteTriggerCondition::Typing)
+                .unwrap();
+
+        let (completion, tab_jump, diff) = match suggestion {
+            Some(Suggestion::Edit {
+                target,
+                completion,
+                tab_jump,
+                diff,
+            }) => {
+                assert_eq!(target, TargetDocument::Active);
+                (completion, tab_jump, diff)
+            }
+            other => panic!("expected an edit suggestion, got {other:?}"),
+        };
+        assert_eq!(completion.completion_id.to_string(), "second");
+        assert_eq!(diff.path, ACTIVE_URI);
+        let tab_jump = tab_jump.expect("expected the jump to be carried on the edit");
+        assert_eq!(tab_jump.completion_id.to_string(), "first");
+
+        let requests = client.requests.lock();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0.cursor_offset, 0);
+        assert_eq!(requests[0].1, SupercompleteTriggerCondition::Typing);
+        assert_eq!(requests[1].0.cursor_offset, 10);
+        let cursor = requests[1].0.cursor_position.as_ref().unwrap();
+        assert_eq!((cursor.row, cursor.col), (2, 2));
+        assert_eq!(
+            requests[1].1,
+            SupercompleteTriggerCondition::CursorLineNavigation
+        );
+    }
+
+    #[test]
+    fn test_jump_to_other_document_returns_jump() {
+        let active = document(ACTIVE_URI, ACTIVE_TEXT);
+        let other_documents = vec![
+            document(OTHER_URI, "unrelated\n"),
+            document(THIRD_URI, OTHER_TEXT),
+        ];
+        let client = FakeCompletionClient::new(vec![Ok(response(serde_json::json!({
+            "completionId": "jump",
+            "tabJump": {
+                "path": THIRD_URI,
+                "jumpPosition": { "row": "1", "col": "2" }
+            }
+        })))]);
+
+        let suggestion = request_suggestion_with(
+            &client,
+            &active,
+            &other_documents,
+            SupercompleteTriggerCondition::Typing,
+        )
+        .unwrap();
+
+        let (document_index, offset, completion) = match suggestion {
+            Some(Suggestion::JumpToOtherDocument {
+                document_index,
+                offset,
+                completion,
+            }) => (document_index, offset, completion),
+            other => panic!("expected a jump to another document, got {other:?}"),
+        };
+        assert_eq!(document_index, 1);
+        assert_eq!(offset, 8);
+        assert_eq!(completion.completion_id.to_string(), "jump");
+        assert_eq!(client.requests.lock().len(), 1);
+    }
+
+    #[test]
+    fn test_jump_to_unopened_document_returns_no_suggestion() {
+        let active = document(ACTIVE_URI, ACTIVE_TEXT);
+        let other_documents = vec![document(OTHER_URI, OTHER_TEXT)];
+        let client = FakeCompletionClient::new(vec![Ok(response(serde_json::json!({
+            "completionId": "jump",
+            "tabJump": {
+                "path": "file:///project/src/closed.rs",
+                "jumpPosition": { "row": "0", "col": "0" }
+            }
+        })))]);
+
+        let suggestion = request_suggestion_with(
+            &client,
+            &active,
+            &other_documents,
+            SupercompleteTriggerCondition::Typing,
+        )
+        .unwrap();
+
+        assert!(suggestion.is_none());
+        assert_eq!(client.requests.lock().len(), 1);
+    }
+
+    #[test]
+    fn test_jump_without_position_returns_no_suggestion() {
+        let active = document(ACTIVE_URI, ACTIVE_TEXT);
+        let client = FakeCompletionClient::new(vec![Ok(response(serde_json::json!({
+            "completionId": "jump",
+            "tabJump": { "path": ACTIVE_URI }
+        })))]);
+
+        let suggestion =
+            request_suggestion_with(&client, &active, &[], SupercompleteTriggerCondition::Typing)
+                .unwrap();
+
+        assert!(suggestion.is_none());
+        assert_eq!(client.requests.lock().len(), 1);
+    }
+
+    #[test]
+    fn test_jump_outside_active_document_returns_no_suggestion() {
+        let active = document(ACTIVE_URI, ACTIVE_TEXT);
+        let client = FakeCompletionClient::new(vec![Ok(response(serde_json::json!({
+            "completionId": "jump",
+            "tabJump": {
+                "path": ACTIVE_URI,
+                "jumpPosition": { "row": "10", "col": "0" }
+            }
+        })))]);
+
+        let suggestion =
+            request_suggestion_with(&client, &active, &[], SupercompleteTriggerCondition::Typing)
+                .unwrap();
+
+        assert!(suggestion.is_none());
+        assert_eq!(client.requests.lock().len(), 1);
+    }
+
+    #[test]
+    fn test_diff_in_other_document_produces_edit_for_that_document() {
+        let active = document(ACTIVE_URI, ACTIVE_TEXT);
+        let other_documents = vec![
+            document(OTHER_URI, "unrelated\n"),
+            document(THIRD_URI, OTHER_TEXT),
+        ];
+        let client = FakeCompletionClient::new(vec![Ok(response(serde_json::json!({
+            "completionId": "edit",
+            "diff": { "path": THIRD_URI }
+        })))]);
+
+        let suggestion = request_suggestion_with(
+            &client,
+            &active,
+            &other_documents,
+            SupercompleteTriggerCondition::Forced,
+        )
+        .unwrap();
+
+        match suggestion {
+            Some(Suggestion::Edit {
+                target,
+                completion,
+                tab_jump,
+                diff,
+            }) => {
+                assert_eq!(target, TargetDocument::Other(1));
+                assert_eq!(completion.completion_id.to_string(), "edit");
+                assert!(tab_jump.is_none());
+                assert_eq!(diff.path, THIRD_URI);
+            }
+            other => panic!("expected an edit suggestion, got {other:?}"),
+        }
+        assert_eq!(client.requests.lock().len(), 1);
+    }
+
+    #[test]
+    fn test_diff_for_unopened_document_returns_no_suggestion() {
+        let active = document(ACTIVE_URI, ACTIVE_TEXT);
+        let other_documents = vec![document(OTHER_URI, OTHER_TEXT)];
+        let client = FakeCompletionClient::new(vec![Ok(response(serde_json::json!({
+            "completionId": "edit",
+            "diff": { "path": "file:///project/src/closed.rs" }
+        })))]);
+
+        let suggestion = request_suggestion_with(
+            &client,
+            &active,
+            &other_documents,
+            SupercompleteTriggerCondition::Typing,
+        )
+        .unwrap();
+
+        assert!(suggestion.is_none());
+        assert_eq!(client.requests.lock().len(), 1);
+    }
+
+    #[test]
+    fn test_response_without_diff_or_jump_returns_no_suggestion() {
+        let active = document(ACTIVE_URI, ACTIVE_TEXT);
+        let client = FakeCompletionClient::new(vec![Ok(response(serde_json::json!({
+            "completionId": "empty",
+            "stopReason": "STOP_REASON_NO_EDIT"
+        })))]);
+
+        let suggestion =
+            request_suggestion_with(&client, &active, &[], SupercompleteTriggerCondition::Typing)
+                .unwrap();
+
+        assert!(suggestion.is_none());
+        assert_eq!(client.requests.lock().len(), 1);
+    }
+
+    #[test]
+    fn test_find_target_document_with_empty_path() {
+        let active = document(ACTIVE_URI, ACTIVE_TEXT);
+        let other_documents = vec![
+            document(OTHER_URI, OTHER_TEXT),
+            document(THIRD_URI, "unrelated\n"),
+        ];
+
+        assert_eq!(
+            find_target_document("", &active, &other_documents),
+            Some(TargetDocument::Active)
+        );
+        assert_eq!(
+            find_target_document("", &active, &[]),
+            Some(TargetDocument::Active)
+        );
+        assert_eq!(
+            find_target_document(ACTIVE_URI, &active, &other_documents),
+            Some(TargetDocument::Active)
+        );
+        assert_eq!(
+            find_target_document(THIRD_URI, &active, &other_documents),
+            Some(TargetDocument::Other(1))
+        );
+        assert_eq!(
+            find_target_document("file:///project/src/closed.rs", &active, &other_documents),
+            None
+        );
+    }
+
+    #[test]
+    fn test_request_error_is_propagated() {
+        let active = document(ACTIVE_URI, ACTIVE_TEXT);
+        let client = FakeCompletionClient::new(vec![Err(anyhow::anyhow!("transport failed"))]);
+
+        let error =
+            request_suggestion_with(&client, &active, &[], SupercompleteTriggerCondition::Typing)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("transport failed"));
+    }
+
+    #[test]
+    fn test_jump_follow_up_error_is_propagated() {
+        let active = document(ACTIVE_URI, ACTIVE_TEXT);
+        let client = FakeCompletionClient::new(vec![
+            Ok(response(serde_json::json!({
+                "completionId": "first",
+                "tabJump": {
+                    "path": ACTIVE_URI,
+                    "jumpPosition": { "row": "2", "col": "2" }
+                }
+            }))),
+            Err(anyhow::anyhow!("transport failed")),
+        ]);
+
+        let error =
+            request_suggestion_with(&client, &active, &[], SupercompleteTriggerCondition::Typing)
+                .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("failed to request the edit at Devin's jump target"));
+        assert!(message.contains("transport failed"));
     }
 }
