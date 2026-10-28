@@ -276,7 +276,7 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
     }
 
     fn icons(&self, _cx: &App) -> EditPredictionIconSet {
-        EditPredictionIconSet::new(IconName::ZedPredict)
+        EditPredictionIconSet::new(IconName::AiDevin)
     }
 
     fn is_enabled(&self, buffer: &Entity<Buffer>, _cursor_position: Anchor, cx: &App) -> bool {

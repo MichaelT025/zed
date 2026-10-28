@@ -313,7 +313,7 @@ impl Render for EditPredictionButton {
                         })
                         .anchor(Anchor::BottomRight)
                         .trigger_with_tooltip(
-                            IconButton::new("devin-icon", IconName::ZedPredict)
+                            IconButton::new("devin-icon", IconName::AiDevin)
                                 .shape(IconButtonShape::Square)
                                 .tab_index(0isize)
                                 .aria_label("Edit Prediction")

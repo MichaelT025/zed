@@ -371,7 +371,7 @@ fn render_devin_provider(
     };
 
     let header = SettingsSectionHeader::new("Devin")
-        .icon(IconName::ZedPredict)
+        .icon(IconName::AiDevin)
         .no_padding(true);
     let container = v_flex()
         .id("devin")
