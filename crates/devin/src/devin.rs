@@ -15,6 +15,7 @@ use http_client::{AsyncBody, HttpClient, Method, Request};
 use util::ResultExt as _;
 
 pub use devin_edit_prediction_delegate::DevinEditPredictionDelegate;
+use devin_edit_prediction_delegate::CurrentPrediction;
 use language_server::{API_SERVER_URL, DevinInstallation, DevinLanguageServer};
 use lsp_connection::WorkspaceFolder;
 use protocol::{ExchangeDevinCodeResponse, SEAT_MANAGEMENT_SERVICE};
@@ -46,6 +47,9 @@ pub struct Devin {
     /// Buffers that requested predictions, most recent first, used to prioritize the open
     /// documents sent as context.
     recent_buffers: Vec<EntityId>,
+    /// A prediction for a buffer other than the one that requested it, waiting for that
+    /// buffer's editor to show it.
+    prediction_for_other_buffer: Option<CurrentPrediction>,
     _load_credentials: Task<()>,
 }
 
@@ -99,6 +103,7 @@ impl Devin {
                 uuid::Uuid::new_v4()
             ),
             recent_buffers: Vec::new(),
+            prediction_for_other_buffer: None,
             _load_credentials: load_credentials,
         }
     }
@@ -181,6 +186,25 @@ impl Devin {
 
     pub(crate) fn recent_buffers(&self) -> &[EntityId] {
         &self.recent_buffers
+    }
+
+    pub(crate) fn set_prediction_for_other_buffer(&mut self, prediction: CurrentPrediction) {
+        self.prediction_for_other_buffer = Some(prediction);
+    }
+
+    pub(crate) fn take_prediction_for_buffer(
+        &mut self,
+        buffer_id: EntityId,
+    ) -> Option<CurrentPrediction> {
+        if self
+            .prediction_for_other_buffer
+            .as_ref()
+            .is_some_and(|prediction| prediction.buffer_id() == buffer_id)
+        {
+            self.prediction_for_other_buffer.take()
+        } else {
+            None
+        }
     }
 
     pub fn sign_in_url(&self) -> String {
