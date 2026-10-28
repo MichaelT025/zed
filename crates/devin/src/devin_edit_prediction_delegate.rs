@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     ops::Range,
     path::PathBuf,
     sync::Arc,
@@ -36,9 +37,11 @@ pub struct DevinEditPredictionDelegate {
     project: Option<WeakEntity<Project>>,
     pending_request: Option<Task<Result<()>>>,
     current_prediction: Option<CurrentPrediction>,
+    /// A suggestion in another file, shown as a jump to that file.
+    jump_to_other_file: Option<JumpToOtherFile>,
 }
 
-struct CurrentPrediction {
+pub(crate) struct CurrentPrediction {
     buffer_id: EntityId,
     server: Arc<DevinLanguageServer>,
     completion: ServerCompletion,
@@ -54,7 +57,14 @@ struct CurrentPrediction {
     shown_at: Option<Instant>,
 }
 
-#[derive(Clone)]
+struct JumpToOtherFile {
+    source_buffer_id: EntityId,
+    completion_id: SharedString,
+    snapshot: BufferSnapshot,
+    target: Anchor,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ServerCompletion {
     completion_id: SharedString,
     prompt_id: String,
@@ -69,16 +79,67 @@ impl ServerCompletion {
     }
 }
 
-struct ResolvedCompletion {
-    completion: ServerCompletion,
-    tab_jump: Option<ServerCompletion>,
-    diff: SupercompleteDiff,
+/// The document a suggestion applies to: the one the request was made for, or one of the other
+/// open documents sent as context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetDocument {
+    Active,
+    Other(usize),
+}
+
+#[derive(Debug)]
+enum Suggestion {
+    Edit {
+        target: TargetDocument,
+        completion: ServerCompletion,
+        /// The jump suggestion the edit was requested for, if any.
+        tab_jump: Option<ServerCompletion>,
+        diff: SupercompleteDiff,
+    },
+    JumpToOtherDocument {
+        document_index: usize,
+        offset: usize,
+        completion: ServerCompletion,
+    },
+}
+
+enum ResolvedPrediction {
+    Local(CurrentPrediction),
+    OtherFile(CurrentPrediction),
+    Jump(JumpToOtherFile),
+}
+
+/// Requests completions, abstracted so that suggestion handling can be tested without a server.
+trait CompletionClient {
+    fn complete(
+        &self,
+        document: Document,
+        other_documents: Vec<Document>,
+        editor_options: EditorOptions,
+        trigger: SupercompleteTriggerCondition,
+    ) -> impl Future<Output = Result<HandleStreamingTabV2Response>> + Send;
+}
+
+impl CompletionClient for DevinLanguageServer {
+    fn complete(
+        &self,
+        document: Document,
+        other_documents: Vec<Document>,
+        editor_options: EditorOptions,
+        trigger: SupercompleteTriggerCondition,
+    ) -> impl Future<Output = Result<HandleStreamingTabV2Response>> + Send {
+        DevinLanguageServer::complete(self, document, other_documents, editor_options, trigger)
+    }
 }
 
 impl CurrentPrediction {
     fn interpolate(&self, new_snapshot: &BufferSnapshot) -> Option<Vec<(Range<Anchor>, Arc<str>)>> {
         interpolate_edits(&self.snapshot, new_snapshot, &self.edits)
             .filter(|edits| !edits.is_empty())
+    }
+
+    pub(crate) fn buffer_id(&self) -> EntityId {
+        self.buffer_id
     }
 
     /// Tells Devin whether the prediction was accepted. Predictions that were never shown aren't
@@ -135,6 +196,7 @@ impl DevinEditPredictionDelegate {
             project,
             pending_request: None,
             current_prediction: None,
+            jump_to_other_file: None,
         }
     }
 
@@ -144,8 +206,34 @@ impl DevinEditPredictionDelegate {
         }
     }
 
+    /// Takes over a prediction that another editor's request produced for this buffer, so that
+    /// following a jump to this file shows the edit the jump was for.
+    fn adopt_prediction_for_buffer(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let buffer_id = buffer.entity_id();
+        let Some(prediction) = self
+            .devin
+            .update(cx, |devin, _| devin.take_prediction_for_buffer(buffer_id))
+        else {
+            return false;
+        };
+        if prediction.interpolate(&buffer.read(cx).snapshot()).is_none() {
+            return false;
+        }
+        self.jump_to_other_file = None;
+        self.set_prediction(Some(prediction), cx);
+        true
+    }
+
     /// Collects the project's other open files, most recently used first, within the size budget.
-    fn other_document_sources(&self, buffer: &Entity<Buffer>, cx: &App) -> Vec<DocumentSource> {
+    fn other_document_sources(
+        &self,
+        buffer: &Entity<Buffer>,
+        cx: &App,
+    ) -> Vec<(Entity<Buffer>, DocumentSource)> {
         let Some(project) = self.project.as_ref().and_then(|project| project.upgrade()) else {
             return Vec::new();
         };
@@ -161,13 +249,13 @@ impl DevinEditPredictionDelegate {
 
         let mut total_len = 0;
         buffers
-            .iter()
+            .into_iter()
             .filter_map(|other| {
                 let source = DocumentSource::new(other.read(cx), cx)?;
                 let len = source.snapshot.len();
                 (total_len + len < MAX_OTHER_DOCUMENTS_BYTES).then(|| {
                     total_len += len;
-                    source
+                    (other, source)
                 })
             })
             .collect()
@@ -218,6 +306,10 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
         {
             return;
         }
+        if self.adopt_prediction_for_buffer(&buffer, cx) {
+            cx.notify();
+            return;
+        }
 
         let Some(source) = DocumentSource::new(buffer.read(cx), cx) else {
             return;
@@ -229,7 +321,11 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
         }) else {
             return;
         };
-        let other_sources = self.other_document_sources(&buffer, cx);
+        let (other_buffers, other_sources): (Vec<_>, Vec<_>) = self
+            .other_document_sources(&buffer, cx)
+            .into_iter()
+            .map(|(other_buffer, source)| ((other_buffer, source.snapshot.clone()), source))
+            .unzip();
         let editor_options = {
             let settings = LanguageSettings::for_buffer(buffer.read(cx), cx);
             EditorOptions {
@@ -254,7 +350,7 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
 
             let result = async {
                 let server = server.await.map_err(|error| anyhow!("{error}"))?;
-                let resolved = cx
+                let (document, other_documents, suggestion) = cx
                     .background_spawn({
                         let server = server.clone();
                         async move {
@@ -262,34 +358,68 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
                             let other_documents = other_sources
                                 .into_iter()
                                 .map(DocumentSource::into_document)
-                                .collect();
-                            let resolved = request_completion(
-                                &server,
+                                .collect::<Vec<_>>();
+                            let suggestion = request_suggestion(
+                                server.as_ref(),
                                 &document,
-                                other_documents,
+                                &other_documents,
                                 editor_options,
                                 trigger_condition,
                             )
                             .await?;
-                            anyhow::Ok(resolved.map(|resolved| (document, resolved)))
+                            anyhow::Ok((document, other_documents, suggestion))
                         }
                     })
                     .await?;
-                let Some((document, resolved)) = resolved else {
-                    return Ok(None);
+
+                let (target, completion, tab_jump, diff) = match suggestion {
+                    None => return Ok(None),
+                    Some(Suggestion::JumpToOtherDocument {
+                        document_index,
+                        offset,
+                        completion,
+                    }) => {
+                        let (_, target_snapshot) = other_buffers
+                            .get(document_index)
+                            .context("jump target is not an open document")?;
+                        return Ok(Some(ResolvedPrediction::Jump(JumpToOtherFile {
+                            source_buffer_id: buffer_id,
+                            completion_id: completion.completion_id,
+                            snapshot: target_snapshot.clone(),
+                            target: target_snapshot.anchor_before(offset),
+                        })));
+                    }
+                    Some(Suggestion::Edit {
+                        target,
+                        completion,
+                        tab_jump,
+                        diff,
+                    }) => (target, completion, tab_jump, diff),
                 };
-                if !diff_targets_document(&resolved.diff.path, &document.absolute_uri) {
-                    log::debug!(
-                        "Devin suggested an edit in another file, which isn't supported yet"
-                    );
-                    return Ok(None);
-                }
-                let diff = resolved.diff;
-                let (document, converted, completion_text) = cx
+
+                let (target_buffer, target_snapshot, target_document) = match target {
+                    TargetDocument::Active => (buffer.clone(), snapshot, document),
+                    TargetDocument::Other(index) => {
+                        let (target_buffer, target_snapshot) = other_buffers
+                            .get(index)
+                            .context("edit target is not an open document")?;
+                        let target_document = other_documents
+                            .into_iter()
+                            .nth(index)
+                            .context("edit target is not an open document")?;
+                        (
+                            target_buffer.clone(),
+                            target_snapshot.clone(),
+                            target_document,
+                        )
+                    }
+                };
+                let (target_document, converted, completion_text) = cx
                     .background_spawn(async move {
-                        let converted = convert_diff(&document.text, &diff)?;
-                        let completion_text = apply_edits(&document.text, &converted.edits);
-                        anyhow::Ok((document, converted, completion_text))
+                        let converted = convert_diff(&target_document.text, &diff)?;
+                        let completion_text =
+                            apply_edits(&target_document.text, &converted.edits);
+                        anyhow::Ok((target_document, converted, completion_text))
                     })
                     .await
                     .context("Devin returned a diff that doesn't match the buffer")?;
@@ -302,7 +432,8 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
                     .iter()
                     .map(|(range, new_text)| {
                         (
-                            snapshot.anchor_after(range.start)..snapshot.anchor_before(range.end),
+                            target_snapshot.anchor_after(range.start)
+                                ..target_snapshot.anchor_before(range.end),
                             Arc::from(new_text.as_str()),
                         )
                     })
@@ -317,41 +448,69 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
                         .map(|((range, _), _)| range.start);
                     match edit_anchor {
                         Some(anchor) => PredictedCursorPosition::new(anchor, offset_in_edit),
-                        None => {
-                            PredictedCursorPosition::at_anchor(snapshot.anchor_before(old_offset))
-                        }
+                        None => PredictedCursorPosition::at_anchor(
+                            target_snapshot.anchor_before(old_offset),
+                        ),
                     }
                 });
-                let edit_preview = buffer
+                let edit_preview = target_buffer
                     .read_with(cx, |buffer, cx| buffer.preview_edits(edits.clone(), cx))
                     .await;
 
-                anyhow::Ok(Some(CurrentPrediction {
-                    buffer_id,
+                let prediction = CurrentPrediction {
+                    buffer_id: target_buffer.entity_id(),
                     server,
-                    completion: resolved.completion,
-                    tab_jump: resolved.tab_jump,
-                    document,
+                    completion,
+                    tab_jump,
+                    document: target_document,
                     completion_text,
-                    snapshot,
+                    snapshot: target_snapshot,
                     edits,
                     cursor_position,
                     edit_preview,
                     shown_at: None,
+                };
+                anyhow::Ok(Some(match target {
+                    TargetDocument::Active => ResolvedPrediction::Local(prediction),
+                    TargetDocument::Other(_) => ResolvedPrediction::OtherFile(prediction),
                 }))
             }
             .await;
 
             this.update(cx, |this, cx| {
                 this.pending_request = None;
-                let prediction = match result {
-                    Ok(prediction) => prediction,
+                let resolved = match result {
+                    Ok(resolved) => resolved,
                     Err(error) => {
                         log::error!("Devin edit prediction failed: {error:#}");
                         None
                     }
                 };
-                this.set_prediction(prediction, cx);
+                this.jump_to_other_file = None;
+                match resolved {
+                    None => this.set_prediction(None, cx),
+                    Some(ResolvedPrediction::Local(prediction)) => {
+                        this.set_prediction(Some(prediction), cx)
+                    }
+                    Some(ResolvedPrediction::OtherFile(prediction)) => {
+                        this.set_prediction(None, cx);
+                        if let Some((target, _)) = prediction.edits.first() {
+                            this.jump_to_other_file = Some(JumpToOtherFile {
+                                source_buffer_id: buffer_id,
+                                completion_id: prediction.completion.completion_id.clone(),
+                                snapshot: prediction.snapshot.clone(),
+                                target: target.start,
+                            });
+                        }
+                        this.devin.update(cx, |devin, _| {
+                            devin.set_prediction_for_other_buffer(prediction)
+                        });
+                    }
+                    Some(ResolvedPrediction::Jump(jump)) => {
+                        this.set_prediction(None, cx);
+                        this.jump_to_other_file = Some(jump);
+                    }
+                }
                 cx.notify();
             })
         }));
@@ -359,6 +518,7 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
 
     fn accept(&mut self, cx: &mut Context<Self>) {
         self.pending_request = None;
+        self.jump_to_other_file = None;
         if let Some(prediction) = self.current_prediction.take() {
             prediction.report_outcome(true, false, cx);
         }
@@ -366,6 +526,7 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
 
     fn discard(&mut self, reason: EditPredictionDiscardReason, cx: &mut Context<Self>) {
         self.pending_request = None;
+        self.jump_to_other_file = None;
         if let Some(prediction) = self.current_prediction.take() {
             prediction.report_outcome(
                 false,
@@ -387,10 +548,24 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
         _cursor_position: Anchor,
         cx: &mut Context<Self>,
     ) -> Option<EditPrediction> {
-        let current_prediction = self.current_prediction.as_ref()?;
-        if current_prediction.buffer_id != buffer.entity_id() {
+        if let Some(jump) = &self.jump_to_other_file
+            && jump.source_buffer_id == buffer.entity_id()
+        {
+            return Some(EditPrediction::Jump {
+                id: Some(jump.completion_id.clone()),
+                snapshot: jump.snapshot.clone(),
+                target: jump.target,
+            });
+        }
+
+        let has_prediction_for_buffer = self
+            .current_prediction
+            .as_ref()
+            .is_some_and(|prediction| prediction.buffer_id == buffer.entity_id());
+        if !has_prediction_for_buffer && !self.adopt_prediction_for_buffer(buffer, cx) {
             return None;
         }
+        let current_prediction = self.current_prediction.as_ref()?;
         let snapshot = buffer.read(cx).snapshot();
         let edits = current_prediction.interpolate(&snapshot)?;
         // The predicted cursor is only meaningful for the edits exactly as they were predicted.
@@ -404,20 +579,36 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
     }
 }
 
-/// Requests a completion at the cursor. When Devin suggests jumping elsewhere in the document,
-/// this requests the edit at the jump target instead, because Zed shows edits away from the cursor
-/// behind its own jump affordance, while a bare jump within a file has no equivalent.
-async fn request_completion(
-    server: &DevinLanguageServer,
+/// Finds the document a suggestion's path refers to, preferring the active document.
+fn find_target_document(
+    path: &str,
     document: &Document,
-    other_documents: Vec<Document>,
+    other_documents: &[Document],
+) -> Option<TargetDocument> {
+    if diff_targets_document(path, &document.absolute_uri) {
+        return Some(TargetDocument::Active);
+    }
+    other_documents
+        .iter()
+        .position(|other| !path.is_empty() && diff_targets_document(path, &other.absolute_uri))
+        .map(TargetDocument::Other)
+}
+
+/// Requests a suggestion at the cursor. When Devin suggests jumping elsewhere in the active
+/// document, this requests the edit at the jump target instead, because Zed shows edits away from
+/// the cursor behind its own jump affordance, while a bare jump within a file has no equivalent.
+/// Jumps to other open documents are returned as they are.
+async fn request_suggestion(
+    client: &impl CompletionClient,
+    document: &Document,
+    other_documents: &[Document],
     editor_options: EditorOptions,
     trigger: SupercompleteTriggerCondition,
-) -> Result<Option<ResolvedCompletion>> {
-    let mut response = server
+) -> Result<Option<Suggestion>> {
+    let mut response = client
         .complete(
             document.clone(),
-            other_documents.clone(),
+            other_documents.to_vec(),
             editor_options.clone(),
             trigger,
         )
@@ -427,27 +618,46 @@ async fn request_completion(
     if response.diff.is_none()
         && let Some(jump) = response.tab_jump.take()
     {
-        if !diff_targets_document(&jump.path, &document.absolute_uri) {
-            log::debug!("Devin suggested a jump to another file, which isn't supported yet");
-            return Ok(None);
-        }
-        let Some(jump_offset) = jump
-            .jump_position
-            .and_then(|position| jump_offset(&document.text, position))
-        else {
-            log::debug!("Devin suggested a jump outside the document");
+        let Some(position) = jump.jump_position else {
+            log::debug!("Devin suggested a jump without a position");
             return Ok(None);
         };
-        tab_jump = Some(ServerCompletion::new(&response));
-        response = server
-            .complete(
-                document.with_cursor(jump_offset),
-                other_documents,
-                editor_options,
-                SupercompleteTriggerCondition::CursorLineNavigation,
-            )
-            .await
-            .context("failed to request the edit at Devin's jump target")?;
+        match find_target_document(&jump.path, document, other_documents) {
+            Some(TargetDocument::Active) => {
+                let Some(offset) = jump_offset(&document.text, position) else {
+                    log::debug!("Devin suggested a jump outside the document");
+                    return Ok(None);
+                };
+                tab_jump = Some(ServerCompletion::new(&response));
+                response = client
+                    .complete(
+                        document.with_cursor(offset),
+                        other_documents.to_vec(),
+                        editor_options,
+                        SupercompleteTriggerCondition::CursorLineNavigation,
+                    )
+                    .await
+                    .context("failed to request the edit at Devin's jump target")?;
+            }
+            Some(TargetDocument::Other(document_index)) => {
+                let Some(offset) = other_documents
+                    .get(document_index)
+                    .and_then(|other| jump_offset(&other.text, position))
+                else {
+                    log::debug!("Devin suggested a jump outside the target document");
+                    return Ok(None);
+                };
+                return Ok(Some(Suggestion::JumpToOtherDocument {
+                    document_index,
+                    offset,
+                    completion: ServerCompletion::new(&response),
+                }));
+            }
+            None => {
+                log::debug!("Devin suggested a jump to a file that isn't open");
+                return Ok(None);
+            }
+        }
     }
 
     let completion = ServerCompletion::new(&response);
@@ -459,7 +669,12 @@ async fn request_completion(
         );
         return Ok(None);
     };
-    Ok(Some(ResolvedCompletion {
+    let Some(target) = find_target_document(&diff.path, document, other_documents) else {
+        log::debug!("Devin suggested an edit in a file that isn't open");
+        return Ok(None);
+    };
+    Ok(Some(Suggestion::Edit {
+        target,
         completion,
         tab_jump,
         diff,
