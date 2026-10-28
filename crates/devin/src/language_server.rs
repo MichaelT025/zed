@@ -41,6 +41,9 @@ const COMPATIBLE_IDE_NAME: &str = "windsurf";
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+/// The server holds a completion request open instead of answering when it has nothing to
+/// suggest, so a request that runs this long is treated as having no suggestion.
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HEARTBEAT_FAILURES: u32 = 3;
@@ -119,6 +122,7 @@ pub struct DevinLanguageServer {
     context_state: Mutex<ContextState>,
     process: Mutex<util::process::Child>,
     lsp: Option<LspConnection>,
+    executor: BackgroundExecutor,
     _callback_server: CallbackServer,
     _tasks: Vec<Task<()>>,
 }
@@ -362,6 +366,7 @@ impl DevinLanguageServer {
             context_state: Mutex::default(),
             process: Mutex::new(process),
             lsp,
+            executor,
             _callback_server: callback_server,
             _tasks: tasks,
         })
@@ -412,12 +417,40 @@ impl DevinLanguageServer {
             supercomplete_aggression: "SUPERCOMPLETE_AGGRESSION_MEDIUM",
         };
         let started_at = Instant::now();
-        let result: Result<HandleStreamingTabV2Response> = self
+        // The HTTP timeout only backs up the completion timeout, which ends the request first.
+        let call = self
             .rpc
-            .call("HandleStreamingTabV2", &request, RPC_TIMEOUT)
-            .await;
+            .call::<_, HandleStreamingTabV2Response>(
+                "HandleStreamingTabV2",
+                &request,
+                COMPLETION_TIMEOUT * 2,
+            )
+            .fuse();
+        let timeout = self.executor.timer(COMPLETION_TIMEOUT).fuse();
+        futures::pin_mut!(call, timeout);
+        let result = futures::select_biased! {
+            result = call => result,
+            _ = timeout => {
+                log::debug!(
+                    "Devin completion request ({trigger:?}) had no suggestion within {COMPLETION_TIMEOUT:?}"
+                );
+                return Ok(HandleStreamingTabV2Response::default());
+            }
+        };
         let elapsed_ms = started_at.elapsed().as_millis();
         match &result {
+            Err(error)
+                if error
+                    .downcast_ref::<RpcError>()
+                    .is_some_and(|error| error.code == "canceled") =>
+            {
+                // The extension ignores requests the server cancels, as it does when a newer
+                // request supersedes them.
+                log::debug!(
+                    "Devin completion request ({trigger:?}) was canceled by the server after {elapsed_ms}ms"
+                );
+                return Ok(HandleStreamingTabV2Response::default());
+            }
             Ok(response) => {
                 if response.diff.is_some() {
                     log::debug!(
@@ -525,6 +558,27 @@ impl Drop for DevinLanguageServer {
     }
 }
 
+/// An error status returned by the server, with the Connect error's code and message.
+#[derive(Debug)]
+struct RpcError {
+    method: String,
+    status: String,
+    code: String,
+    message: String,
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} returned {} {}: {}",
+            self.method, self.status, self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for RpcError {}
+
 struct Rpc {
     http_client: Arc<dyn HttpClient>,
     base_url: String,
@@ -558,21 +612,21 @@ impl Rpc {
         let mut body = Vec::new();
         response.body_mut().read_to_end(&mut body).await?;
         if !response.status().is_success() {
-            let detail = serde_json::from_slice::<serde_json::Value>(&body)
-                .ok()
-                .map(|error| {
-                    let code = error
-                        .get("code")
-                        .and_then(|code| code.as_str())
-                        .unwrap_or("");
-                    let message = error
-                        .get("message")
-                        .and_then(|message| message.as_str())
-                        .unwrap_or("");
-                    format!("{code}: {message}")
-                })
-                .unwrap_or_default();
-            bail!("{method} returned {} {detail}", response.status());
+            let error = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
+            let field = |name: &str| {
+                error
+                    .get(name)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            return Err(RpcError {
+                method: method.to_string(),
+                status: response.status().to_string(),
+                code: field("code"),
+                message: field("message"),
+            }
+            .into());
         }
         if body.is_empty() {
             body = b"{}".to_vec();
