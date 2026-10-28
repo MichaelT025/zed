@@ -60,6 +60,10 @@ static SEARCH_COMMIT_FORMAT: &str = "--format=%H";
 /// Number of commits to load per chunk for the git graph.
 pub const GRAPH_CHUNK_SIZE: usize = 1000;
 
+/// The first chunk is smaller so the top of the graph can render before the rest of a
+/// large history has streamed in.
+const GRAPH_FIRST_CHUNK_SIZE: usize = 100;
+
 /// Default value for the `git.worktree_directory` setting.
 pub const DEFAULT_WORKTREE_DIRECTORY: &str = "../worktrees";
 
@@ -3312,6 +3316,7 @@ impl GitRepository for RealGitRepository {
 
             let mut line_buffer = String::new();
             let mut lines: Vec<String> = Vec::with_capacity(GRAPH_CHUNK_SIZE);
+            let mut chunk_size = GRAPH_FIRST_CHUNK_SIZE;
 
             loop {
                 line_buffer.clear();
@@ -3332,13 +3337,14 @@ impl GitRepository for RealGitRepository {
                 let line = line_buffer.trim_end_matches('\n').to_string();
                 lines.push(line);
 
-                if lines.len() >= GRAPH_CHUNK_SIZE {
+                if lines.len() >= chunk_size {
                     let commits = parse_initial_graph_output(lines.iter().map(|s| s.as_str()));
                     if request_tx.send(commits).await.is_err() {
                         log::warn!("initial_graph_data: receiver dropped while streaming commits");
                         break;
                     }
                     lines.clear();
+                    chunk_size = GRAPH_CHUNK_SIZE;
                 }
             }
 
