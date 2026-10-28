@@ -170,7 +170,7 @@ pub struct HandleStreamingTabV2Response {
     pub prompt_id: String,
     pub request_uid: String,
     pub diff: Option<SupercompleteDiff>,
-    pub tab_jump: Option<serde_json::Value>,
+    pub tab_jump: Option<TabJump>,
     pub noop: Option<serde_json::Value>,
     pub stop_reason: Option<serde_json::Value>,
     pub filter_reason: Option<serde_json::Value>,
@@ -187,6 +187,13 @@ pub struct SupercompleteDiff {
     pub character_diff: Option<CharacterDiff>,
     pub cursor_position: Option<ResponsePosition>,
     pub old_str: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TabJump {
+    pub path: String,
+    pub jump_position: Option<ResponsePosition>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -440,6 +447,23 @@ pub fn locate_new_offset(edits: &[(Range<usize>, String)], new_offset: usize) ->
         delta += new_text.len() as isize - range.len() as isize;
     }
     (new_offset.saturating_add_signed(-delta), 0)
+}
+
+/// Returns the offset in `text` of a jump target. The column is clamped to its line, because the
+/// position only needs to land on the line the server wants the cursor on.
+pub fn jump_offset(text: &str, position: ResponsePosition) -> Option<usize> {
+    let line_start = line_start_offset(text, position.row)?;
+    let line_end = text[line_start..]
+        .find('\n')
+        .map_or(text.len(), |newline_offset| line_start + newline_offset);
+    let mut offset = usize::try_from(position.col)
+        .ok()
+        .and_then(|column| line_start.checked_add(column))
+        .map_or(line_end, |offset| offset.min(line_end));
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    Some(offset)
 }
 
 /// Returns whether a diff's path refers to the requested document. The server may format file
@@ -777,6 +801,35 @@ mod tests {
         assert_eq!(with_cursor.selections.len(), 1);
         let start = document.with_cursor(0).cursor_position.unwrap();
         assert_eq!((start.row, start.col), (0, 0));
+    }
+
+    #[test]
+    fn test_jump_offset() {
+        let text = "fn main() {\n    let é = 1;\n}";
+        let position = |row, col| ResponsePosition { row, col };
+        assert_eq!(jump_offset(text, position(1, 4)), Some(16));
+        // Past the end of the line, and inside a multi-byte character.
+        assert_eq!(jump_offset(text, position(0, 50)), Some(11));
+        assert_eq!(jump_offset(text, position(1, 9)), Some(20));
+        assert_eq!(jump_offset(text, position(2, 0)), Some(28));
+        assert_eq!(jump_offset(text, position(3, 0)), None);
+    }
+
+    #[test]
+    fn test_parse_tab_jump_response() {
+        let response: HandleStreamingTabV2Response = serde_json::from_value(serde_json::json!({
+            "completionId": "completion",
+            "tabJump": {
+                "path": "file:///synthetic/example.py",
+                "jumpPosition": { "row": "12", "col": "4" },
+                "isImport": false
+            }
+        }))
+        .unwrap();
+        let tab_jump = response.tab_jump.unwrap();
+        assert_eq!(tab_jump.path, "file:///synthetic/example.py");
+        let jump_position = tab_jump.jump_position.unwrap();
+        assert_eq!((jump_position.row, jump_position.col), (12, 4));
     }
 
     #[test]
