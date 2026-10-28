@@ -831,6 +831,24 @@ pub(crate) fn paint_graph_row(
     }
 }
 
+/// Paints the lanes of a row inserted between two commits (for example the
+/// expanded file list of a commit). Every lane carried down from the commit
+/// above continues as a straight vertical line; there is no node circle.
+pub(crate) fn paint_pass_through_row(
+    swimlanes: &[Swimlane],
+    origin: Point<Pixels>,
+    colors: &GraphColors,
+    window: &mut Window,
+) {
+    for (index, lane) in swimlanes.iter().enumerate() {
+        let x = lane_center(index);
+        let mut builder = PathBuilder::stroke(px(1.));
+        builder.move_to(graph_point(origin, x, px(0.)));
+        builder.line_to(graph_point(origin, x, ROW_HEIGHT));
+        paint_stroke(builder, colors.lane(lane.color), window);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
