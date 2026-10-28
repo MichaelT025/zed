@@ -26,8 +26,8 @@ use crate::lsp_connection::{LspConnection, WorkspaceFolder};
 use crate::protocol::{
     Document, EXTENSION_SERVER_SERVICE, EditorOptions, GetUserStatusResponse,
     HandleStreamingTabV2Request, HandleStreamingTabV2Response, IdeAction, LANGUAGE_SERVER_SERVICE,
-    Metadata, MetadataRequest, ProtobufValue, RefreshContextForIdeActionRequest,
-    SupercompleteTriggerCondition, decode_protobuf_fields, encode_native_values_response,
+    Metadata, MetadataRequest, ProtobufValue, ProvideCompletionFeedbackRequest, ProviderSource,
+    RefreshContextForIdeActionRequest, SupercompleteTriggerCondition, decode_protobuf_fields, encode_native_values_response,
     encode_set_native_value_response, parse_language_server_started,
 };
 
@@ -121,6 +121,18 @@ pub struct DevinLanguageServer {
     lsp: Option<LspConnection>,
     _callback_server: CallbackServer,
     _tasks: Vec<Task<()>>,
+}
+
+pub struct CompletionFeedback {
+    pub source: ProviderSource,
+    pub completion_id: String,
+    pub prompt_id: String,
+    pub document: Document,
+    /// The document text with the completion applied.
+    pub completion_text: String,
+    pub is_accepted: bool,
+    pub is_intentional_reject: bool,
+    pub feedback_delay: Duration,
 }
 
 #[derive(Default)]
@@ -402,6 +414,28 @@ impl DevinLanguageServer {
         self.rpc
             .call("HandleStreamingTabV2", &request, RPC_TIMEOUT)
             .await
+    }
+
+    /// Reports whether a shown completion was accepted. Recent feedback is part of the model's
+    /// input for later completions.
+    pub async fn provide_feedback(&self, feedback: CompletionFeedback) -> Result<()> {
+        let request = ProvideCompletionFeedbackRequest {
+            metadata: self.next_metadata(),
+            is_accepted: feedback.is_accepted,
+            feedback_delay_ms: u64::try_from(feedback.feedback_delay.as_millis())
+                .unwrap_or(u64::MAX),
+            completion_id: feedback.completion_id,
+            prompt_id: feedback.prompt_id,
+            source: feedback.source,
+            document: feedback.document,
+            is_intentional_reject: feedback.is_intentional_reject,
+            completion_text: feedback.completion_text,
+        };
+        self.rpc
+            .call::<_, serde_json::Value>("ProvideCompletionFeedback", &request, RPC_TIMEOUT)
+            .await
+            .context("failed to send Devin completion feedback")?;
+        Ok(())
     }
 
     /// Completions fail upstream until the active document has been registered through this

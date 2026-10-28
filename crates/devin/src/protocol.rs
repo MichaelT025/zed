@@ -163,6 +163,29 @@ pub struct MetadataRequest {
     pub metadata: Metadata,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum ProviderSource {
+    #[serde(rename = "PROVIDER_SOURCE_SUPERCOMPLETE")]
+    Supercomplete,
+    #[serde(rename = "PROVIDER_SOURCE_TAB_JUMP")]
+    TabJump,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProvideCompletionFeedbackRequest {
+    pub metadata: Metadata,
+    pub is_accepted: bool,
+    #[serde(serialize_with = "serialize_u64_string")]
+    pub feedback_delay_ms: u64,
+    pub completion_id: String,
+    pub prompt_id: String,
+    pub source: ProviderSource,
+    pub document: Document,
+    pub is_intentional_reject: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub completion_text: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct HandleStreamingTabV2Response {
@@ -466,6 +489,19 @@ pub fn jump_offset(text: &str, position: ResponsePosition) -> Option<usize> {
     Some(offset)
 }
 
+/// Applies non-overlapping edits, given in ascending order, to `text`.
+pub fn apply_edits(text: &str, edits: &[(Range<usize>, String)]) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut offset = 0;
+    for (range, new_text) in edits {
+        result.push_str(&text[offset..range.start]);
+        result.push_str(new_text);
+        offset = range.end;
+    }
+    result.push_str(&text[offset..]);
+    result
+}
+
 /// Returns whether a diff's path refers to the requested document. The server may format file
 /// URIs differently from the request (for example `file:///c%3A/...` versus `file:///C:/...`), so
 /// they're compared as file paths. An empty path is treated as the requested document.
@@ -560,14 +596,6 @@ mod tests {
             .unwrap()
     }
 
-    fn apply(text: &str, edits: &[(Range<usize>, String)]) -> String {
-        let mut result = text.to_string();
-        for (range, new_text) in edits.iter().rev() {
-            result.replace_range(range.clone(), new_text);
-        }
-        result
-    }
-
     // Observed response for the LF fixture recorded in the windsurf-zed research repository.
     #[test]
     fn test_observed_insertion_at_end_of_line() {
@@ -588,7 +616,7 @@ mod tests {
             converted.edits,
             vec![(text.len()..text.len(), "a * b".into())]
         );
-        let new_text = apply(text, &converted.edits);
+        let new_text = apply_edits(text, &converted.edits);
         assert_eq!(
             new_text,
             "def add(a, b):\n    return a + b\n\ndef multiply(a, b):\n    return a * b"
@@ -635,7 +663,7 @@ mod tests {
         }));
 
         let converted = convert_diff(text, &diff).unwrap();
-        let new_text = apply(text, &converted.edits);
+        let new_text = apply_edits(text, &converted.edits);
         assert_eq!(
             new_text,
             "def add(a, b):\n    return a + b\n\nresult = add(2, 3)\nprint(result)"
@@ -679,7 +707,7 @@ mod tests {
         let y_offset = text.find('y').unwrap();
         assert_eq!(converted.edits, vec![(y_offset..y_offset + 1, "x".into())]);
         assert_eq!(
-            apply(text, &converted.edits),
+            apply_edits(text, &converted.edits),
             "fn main() {\n    let x = 1;\n    println!(\"{}\", x);\n}\n"
         );
         assert_eq!(converted.cursor_offset, Some(y_offset + 1));
@@ -780,6 +808,18 @@ mod tests {
     }
 
     #[test]
+    fn test_jump_offset() {
+        let text = "fn main() {\n    let é = 1;\n}";
+        let position = |row, col| ResponsePosition { row, col };
+        assert_eq!(jump_offset(text, position(1, 4)), Some(16));
+        // Past the end of the line, and inside a multi-byte character.
+        assert_eq!(jump_offset(text, position(0, 50)), Some(11));
+        assert_eq!(jump_offset(text, position(1, 9)), Some(20));
+        assert_eq!(jump_offset(text, position(2, 0)), Some(28));
+        assert_eq!(jump_offset(text, position(3, 0)), None);
+    }
+
+    #[test]
     fn test_document_with_cursor() {
         let document = Document {
             absolute_uri: "file:///synthetic/example.rs".into(),
@@ -801,18 +841,6 @@ mod tests {
         assert_eq!(with_cursor.selections.len(), 1);
         let start = document.with_cursor(0).cursor_position.unwrap();
         assert_eq!((start.row, start.col), (0, 0));
-    }
-
-    #[test]
-    fn test_jump_offset() {
-        let text = "fn main() {\n    let é = 1;\n}";
-        let position = |row, col| ResponsePosition { row, col };
-        assert_eq!(jump_offset(text, position(1, 4)), Some(16));
-        // Past the end of the line, and inside a multi-byte character.
-        assert_eq!(jump_offset(text, position(0, 50)), Some(11));
-        assert_eq!(jump_offset(text, position(1, 9)), Some(20));
-        assert_eq!(jump_offset(text, position(2, 0)), Some(28));
-        assert_eq!(jump_offset(text, position(3, 0)), None);
     }
 
     #[test]
