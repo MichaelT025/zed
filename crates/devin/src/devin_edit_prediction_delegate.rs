@@ -1,22 +1,30 @@
-use std::{ops::Range, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    ops::Range,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context as _, Result, anyhow};
 use edit_prediction_types::{
     EditPrediction, EditPredictionDelegate, EditPredictionDiscardReason, EditPredictionIconSet,
-    EditPredictionRequestTrigger, PredictedCursorPosition, interpolate_edits,
+    EditPredictionRequestTrigger, PredictedCursorPosition, SuggestionDisplayType,
+    interpolate_edits,
 };
 use gpui::{App, AppContext as _, Context, Entity, EntityId, SharedString, Task, WeakEntity};
 use icons::IconName;
 use language::{Anchor, Buffer, BufferSnapshot, EditPreview, language_settings::LanguageSettings};
 use project::Project;
 use text::ToOffset as _;
+use util::ResultExt as _;
 
 use crate::{
     Devin,
-    language_server::DevinLanguageServer,
+    language_server::{CompletionFeedback, DevinLanguageServer},
     protocol::{
-        Document, EditorOptions, SupercompleteDiff, SupercompleteTriggerCondition, convert_diff,
-        diff_targets_document, jump_offset, locate_new_offset,
+        Document, EditorOptions, HandleStreamingTabV2Response, ProviderSource, SupercompleteDiff,
+        SupercompleteTriggerCondition, apply_edits, convert_diff, diff_targets_document,
+        jump_offset, locate_new_offset,
     },
 };
 
@@ -32,15 +40,38 @@ pub struct DevinEditPredictionDelegate {
 
 struct CurrentPrediction {
     buffer_id: EntityId,
-    completion_id: SharedString,
+    server: Arc<DevinLanguageServer>,
+    completion: ServerCompletion,
+    /// The jump suggestion this prediction's edit was requested for, if any.
+    tab_jump: Option<ServerCompletion>,
+    document: Document,
+    /// The document text with the prediction applied.
+    completion_text: String,
     snapshot: BufferSnapshot,
     edits: Arc<[(Range<Anchor>, Arc<str>)]>,
     cursor_position: Option<PredictedCursorPosition>,
     edit_preview: EditPreview,
+    shown_at: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct ServerCompletion {
+    completion_id: SharedString,
+    prompt_id: String,
+}
+
+impl ServerCompletion {
+    fn new(response: &HandleStreamingTabV2Response) -> Self {
+        Self {
+            completion_id: response.completion_id.clone().into(),
+            prompt_id: response.prompt_id.clone(),
+        }
+    }
 }
 
 struct ResolvedCompletion {
-    completion_id: SharedString,
+    completion: ServerCompletion,
+    tab_jump: Option<ServerCompletion>,
     diff: SupercompleteDiff,
 }
 
@@ -48,6 +79,52 @@ impl CurrentPrediction {
     fn interpolate(&self, new_snapshot: &BufferSnapshot) -> Option<Vec<(Range<Anchor>, Arc<str>)>> {
         interpolate_edits(&self.snapshot, new_snapshot, &self.edits)
             .filter(|edits| !edits.is_empty())
+    }
+
+    /// Tells Devin whether the prediction was accepted. Predictions that were never shown aren't
+    /// reported, matching Devin's own extension.
+    fn report_outcome(self, is_accepted: bool, is_intentional_reject: bool, cx: &mut App) {
+        let Some(shown_at) = self.shown_at else {
+            return;
+        };
+        let feedback_delay = shown_at.elapsed();
+        let Self {
+            server,
+            completion,
+            tab_jump,
+            document,
+            completion_text,
+            ..
+        } = self;
+        let mut feedback = Vec::new();
+        if let Some(tab_jump) = tab_jump {
+            feedback.push(CompletionFeedback {
+                source: ProviderSource::TabJump,
+                completion_id: tab_jump.completion_id.to_string(),
+                prompt_id: tab_jump.prompt_id,
+                document: document.clone(),
+                completion_text: String::new(),
+                is_accepted,
+                is_intentional_reject,
+                feedback_delay,
+            });
+        }
+        feedback.push(CompletionFeedback {
+            source: ProviderSource::Supercomplete,
+            completion_id: completion.completion_id.to_string(),
+            prompt_id: completion.prompt_id,
+            document,
+            completion_text,
+            is_accepted,
+            is_intentional_reject,
+            feedback_delay,
+        });
+        cx.background_spawn(async move {
+            for feedback in feedback {
+                server.provide_feedback(feedback).await.log_err();
+            }
+        })
+        .detach();
     }
 }
 
@@ -58,6 +135,12 @@ impl DevinEditPredictionDelegate {
             project,
             pending_request: None,
             current_prediction: None,
+        }
+    }
+
+    fn set_prediction(&mut self, prediction: Option<CurrentPrediction>, cx: &mut App) {
+        if let Some(previous) = std::mem::replace(&mut self.current_prediction, prediction) {
+            previous.report_outcome(false, false, cx);
         }
     }
 
@@ -202,8 +285,12 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
                     return Ok(None);
                 }
                 let diff = resolved.diff;
-                let converted = cx
-                    .background_spawn(async move { convert_diff(&document.text, &diff) })
+                let (document, converted, completion_text) = cx
+                    .background_spawn(async move {
+                        let converted = convert_diff(&document.text, &diff)?;
+                        let completion_text = apply_edits(&document.text, &converted.edits);
+                        anyhow::Ok((document, converted, completion_text))
+                    })
                     .await
                     .context("Devin returned a diff that doesn't match the buffer")?;
                 if converted.edits.is_empty() {
@@ -241,37 +328,57 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
 
                 anyhow::Ok(Some(CurrentPrediction {
                     buffer_id,
-                    completion_id: resolved.completion_id,
+                    server,
+                    completion: resolved.completion,
+                    tab_jump: resolved.tab_jump,
+                    document,
+                    completion_text,
                     snapshot,
                     edits,
                     cursor_position,
                     edit_preview,
+                    shown_at: None,
                 }))
             }
             .await;
 
             this.update(cx, |this, cx| {
                 this.pending_request = None;
-                match result {
-                    Ok(prediction) => this.current_prediction = prediction,
+                let prediction = match result {
+                    Ok(prediction) => prediction,
                     Err(error) => {
                         log::error!("Devin edit prediction failed: {error:#}");
-                        this.current_prediction = None;
+                        None
                     }
-                }
+                };
+                this.set_prediction(prediction, cx);
                 cx.notify();
             })
         }));
     }
 
-    fn accept(&mut self, _cx: &mut Context<Self>) {
+    fn accept(&mut self, cx: &mut Context<Self>) {
         self.pending_request = None;
-        self.current_prediction = None;
+        if let Some(prediction) = self.current_prediction.take() {
+            prediction.report_outcome(true, false, cx);
+        }
     }
 
-    fn discard(&mut self, _reason: EditPredictionDiscardReason, _cx: &mut Context<Self>) {
+    fn discard(&mut self, reason: EditPredictionDiscardReason, cx: &mut Context<Self>) {
         self.pending_request = None;
-        self.current_prediction = None;
+        if let Some(prediction) = self.current_prediction.take() {
+            prediction.report_outcome(
+                false,
+                reason == EditPredictionDiscardReason::Rejected,
+                cx,
+            );
+        }
+    }
+
+    fn did_show(&mut self, _display_type: SuggestionDisplayType, _cx: &mut Context<Self>) {
+        if let Some(prediction) = &mut self.current_prediction {
+            prediction.shown_at.get_or_insert_with(Instant::now);
+        }
     }
 
     fn suggest(
@@ -289,7 +396,7 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
         // The predicted cursor is only meaningful for the edits exactly as they were predicted.
         let unchanged = snapshot.version == current_prediction.snapshot.version;
         Some(EditPrediction::Local {
-            id: Some(current_prediction.completion_id.clone()),
+            id: Some(current_prediction.completion.completion_id.clone()),
             edits,
             cursor_position: current_prediction.cursor_position.filter(|_| unchanged),
             edit_preview: Some(current_prediction.edit_preview.clone()),
@@ -316,6 +423,7 @@ async fn request_completion(
         )
         .await?;
 
+    let mut tab_jump = None;
     if response.diff.is_none()
         && let Some(jump) = response.tab_jump.take()
     {
@@ -330,6 +438,7 @@ async fn request_completion(
             log::debug!("Devin suggested a jump outside the document");
             return Ok(None);
         };
+        tab_jump = Some(ServerCompletion::new(&response));
         response = server
             .complete(
                 document.with_cursor(jump_offset),
@@ -341,6 +450,7 @@ async fn request_completion(
             .context("failed to request the edit at Devin's jump target")?;
     }
 
+    let completion = ServerCompletion::new(&response);
     let Some(diff) = response.diff else {
         log::debug!(
             "Devin returned no edit (stop reason: {:?}, filter reason: {:?})",
@@ -350,7 +460,8 @@ async fn request_completion(
         return Ok(None);
     };
     Ok(Some(ResolvedCompletion {
-        completion_id: response.completion_id.into(),
+        completion,
+        tab_jump,
         diff,
     }))
 }
