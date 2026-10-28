@@ -220,7 +220,10 @@ impl DevinEditPredictionDelegate {
         else {
             return false;
         };
-        if prediction.interpolate(&buffer.read(cx).snapshot()).is_none() {
+        if prediction
+            .interpolate(&buffer.read(cx).snapshot())
+            .is_none()
+        {
             return false;
         }
         self.jump_to_other_file = None;
@@ -417,8 +420,7 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
                 let (target_document, converted, completion_text) = cx
                     .background_spawn(async move {
                         let converted = convert_diff(&target_document.text, &diff)?;
-                        let completion_text =
-                            apply_edits(&target_document.text, &converted.edits);
+                        let completion_text = apply_edits(&target_document.text, &converted.edits);
                         anyhow::Ok((target_document, converted, completion_text))
                     })
                     .await
@@ -528,11 +530,7 @@ impl EditPredictionDelegate for DevinEditPredictionDelegate {
         self.pending_request = None;
         self.jump_to_other_file = None;
         if let Some(prediction) = self.current_prediction.take() {
-            prediction.report_outcome(
-                false,
-                reason == EditPredictionDiscardReason::Rejected,
-                cx,
-            );
+            prediction.report_outcome(false, reason == EditPredictionDiscardReason::Rejected, cx);
         }
     }
 
