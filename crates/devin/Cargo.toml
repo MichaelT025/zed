@@ -1,0 +1,39 @@
+[package]
+name = "devin"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/devin.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+edit_prediction_types.workspace = true
+futures.workspace = true
+gpui.workspace = true
+http_client.workspace = true
+icons.workspace = true
+language.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+paths.workspace = true
+project.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smol.workspace = true
+text.workspace = true
+tiny_http.workspace = true
+url.workspace = true
+util.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+zed_credentials_provider.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

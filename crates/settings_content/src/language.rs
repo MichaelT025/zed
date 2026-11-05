@@ -99,6 +99,7 @@ pub enum EditPredictionProvider {
     Ollama,
     OpenAiCompatibleApi,
     Mercury,
+    Devin,
 }
 
 impl EditPredictionProvider {
@@ -110,7 +111,8 @@ impl EditPredictionProvider {
             | EditPredictionProvider::Codestral
             | EditPredictionProvider::Ollama
             | EditPredictionProvider::OpenAiCompatibleApi
-            | EditPredictionProvider::Mercury => false,
+            | EditPredictionProvider::Mercury
+            | EditPredictionProvider::Devin => false,
         }
     }
 
@@ -123,6 +125,7 @@ impl EditPredictionProvider {
             EditPredictionProvider::None => None,
             EditPredictionProvider::Ollama => Some("Ollama"),
             EditPredictionProvider::OpenAiCompatibleApi => Some("OpenAI-Compatible API"),
+            EditPredictionProvider::Devin => Some("Devin"),
         }
     }
 }
