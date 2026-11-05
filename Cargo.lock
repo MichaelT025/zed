@@ -4877,6 +4877,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "devin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "edit_prediction_types",
+ "futures 0.3.34",
+ "gpui",
+ "http_client",
+ "icons",
+ "language",
+ "log",
+ "parking_lot",
+ "paths",
+ "pretty_assertions",
+ "project",
+ "serde",
+ "serde_json",
+ "smol",
+ "text",
+ "tiny_http",
+ "url",
+ "util",
+ "uuid",
+ "zed_credentials_provider",
+]
+
+[[package]]
 name = "diagnostics"
 version = "0.1.0"
 dependencies = [
@@ -5401,6 +5429,7 @@ dependencies = [
  "copilot",
  "copilot_ui",
  "credentials_provider",
+ "devin",
  "edit_prediction",
  "edit_prediction_types",
  "editor",
@@ -16397,6 +16426,7 @@ dependencies = [
  "copilot_ui",
  "cpal",
  "credentials_provider",
+ "devin",
  "edit_prediction",
  "edit_prediction_ui",
  "editor",
@@ -22410,6 +22440,7 @@ dependencies = [
  "debugger_tools",
  "debugger_ui",
  "dev_container",
+ "devin",
  "diagnostics",
  "edit_prediction",
  "edit_prediction_ui",

@@ -571,7 +571,9 @@ impl EditPredictionSettings {
                 .map_or_else(DelayMs::default, |settings| settings.prediction_debounce),
             settings::EditPredictionProvider::Zed => self.zed.prediction_debounce,
             settings::EditPredictionProvider::Mercury => self.mercury.prediction_debounce,
-            settings::EditPredictionProvider::None => DelayMs::default(),
+            settings::EditPredictionProvider::Devin | settings::EditPredictionProvider::None => {
+                DelayMs::default()
+            }
         };
         Duration::from_millis(delay.0)
     }
