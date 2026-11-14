@@ -8902,31 +8902,6 @@ impl GitPanel {
         cx.notify();
     }
 
-    fn preload_commit_history(&mut self, cx: &mut Context<Self>) {
-        if !self.project.read(cx).is_local() {
-            return;
-        }
-
-        let Some(active_repository) = self.active_repository.as_ref() else {
-            return;
-        };
-
-        let Some((log_source, _)) = Self::commit_history_log_source(
-            active_repository,
-            &self.history_ref_filter,
-            self.history_base_ref.as_ref(),
-            cx,
-        ) else {
-            return;
-        };
-        let log_order = LogOrder::TopoOrder;
-
-        // Kick off the git log fetch so data is ready when the user switches to History.
-        // graph_data() is idempotent — if already loading/loaded, this is a no-op.
-        active_repository.update(cx, |repository, cx| {
-            repository.graph_data(log_source, log_order, 0..0, cx);
-        });
-    }
     fn load_commit_history(&mut self, cx: &mut Context<Self>) {
         let Some(active_repository) = self.active_repository.clone() else {
             return;
