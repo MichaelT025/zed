@@ -8895,9 +8895,11 @@ impl GitPanel {
         } else {
             self.activation_focus_handle(cx).focus(window, cx);
         }
-        if tab == GitPanelTab::History && !was_visible && self.is_section_visible(tab, cx) {
+        if tab == GitPanelTab::History {
             self.cancel_pending_branch_changes();
-            self.load_commit_history(cx);
+            if !was_visible && self.is_section_visible(tab, cx) {
+                self.load_commit_history(cx);
+            }
         }
         cx.notify();
     }
