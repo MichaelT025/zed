@@ -9,10 +9,10 @@ use crate::commit_context_menu::{
 };
 use crate::commit_modal::CommitModal;
 use crate::commit_tooltip::CommitTooltip;
-use crate::commit_view::CommitView;
+use crate::commit_view::{CommitView, CommitViewOptions};
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
 use crate::history_ref_picker::{HistoryRefFilter, HistoryRefOption, HistoryRefPicker};
-use crate::project_diff::{DeployBranchDiff, Diff, ProjectDiff};
+use crate::project_diff::{Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::solo_diff_view::SoloDiffView;
 use crate::staged_diff::StagedDiff;
@@ -8632,6 +8632,7 @@ impl GitPanel {
             Some(i) => (i + 1).min(count - 1),
         };
         self.focused_history_entry = Some(new_index);
+        self.history_keyboard_nav = true;
         self.commit_history_scroll_handle.scroll_to_item(
             self.history_list_index_for_commit(new_index),
             ScrollStrategy::Top,
@@ -8649,6 +8650,7 @@ impl GitPanel {
             Some(i) => i.saturating_sub(1),
         };
         self.focused_history_entry = Some(new_index);
+        self.history_keyboard_nav = true;
         self.commit_history_scroll_handle.scroll_to_item(
             self.history_list_index_for_commit(new_index),
             ScrollStrategy::Top,
@@ -8800,6 +8802,7 @@ impl GitPanel {
             cx,
         );
         self.focused_history_entry = Some(index);
+        self.history_keyboard_nav = false;
         self.set_context_menu(context_menu, position, Some(index), window, cx);
     }
 
@@ -9648,8 +9651,10 @@ impl GitPanel {
                     commit_sha.clone(),
                     repository.clone(),
                     workspace.clone(),
-                    None,
-                    Some(repo_path.clone()),
+                    CommitViewOptions {
+                        file_filter: Some(repo_path.clone()),
+                        ..Default::default()
+                    },
                     window,
                     cx,
                 );
@@ -9696,6 +9701,8 @@ impl GitPanel {
         let item_count = list_items.len();
         let commit_history_scroll_handle = self.commit_history_scroll_handle.clone();
         let focused_history_entry = self.focused_history_entry;
+        let active_history_sha = self.active_history_sha;
+        let show_focus_border = self.history_keyboard_nav;
         let hovered_history_entry = self.hovered_history_entry;
         let is_panel_focused = self.focus_handle.is_focused(window);
         let has_context_menu = self.context_menu.is_some();
@@ -9727,9 +9734,7 @@ impl GitPanel {
                         let workspace = workspace;
                         let repo_weak = repo_weak;
                         move |range, _window, cx| {
-                            let local_offset = time::UtcOffset::current_local_offset()
-                                .unwrap_or(time::UtcOffset::UTC);
-                            let now = OffsetDateTime::now_utc();
+                            let date_style = GitPanelSettings::get_global(cx).date_style;
                             let panel_background = cx.theme().colors().panel_background;
                             let graph_colors = GraphColors::vscode_default();
 
@@ -9795,11 +9800,8 @@ impl GitPanel {
                                                     )
                                                     .ok()
                                                     .map(|timestamp| {
-                                                        time_format::format_localized_timestamp(
-                                                            timestamp,
-                                                            now,
-                                                            local_offset,
-                                                            time_format::TimestampFormat::Relative,
+                                                        crate::git_timestamp::format_git_date(
+                                                            timestamp, date_style, cx,
                                                         )
                                                         .into()
                                                     })
@@ -9838,7 +9840,9 @@ impl GitPanel {
                                         let is_hovered = hovered_history_entry == Some(*index);
                                         let is_context_menu_target =
                                             context_menu_target_index == Some(*index);
-                                        let row_background = if is_focused && is_panel_focused {
+                                        let row_background = if entry.sha().is_some()
+                                            && entry.sha() == active_history_sha
+                                        {
                                             Some(cx.theme().colors().element_selected)
                                         } else if is_hovered || is_context_menu_target {
                                             Some(cx.theme().colors().element_hover)
@@ -9863,6 +9867,16 @@ impl GitPanel {
                                             .h(scm_graph::ROW_HEIGHT)
                                             .w_full()
                                             .pr_2()
+                                            .border_1()
+                                            .border_color(gpui::transparent_black())
+                                            .when(
+                                                is_focused && is_panel_focused && show_focus_border,
+                                                |this| {
+                                                    this.border_color(
+                                                        cx.theme().colors().panel_focused_border,
+                                                    )
+                                                },
+                                            )
                                             .when_some(row_background, |this, background| {
                                                 this.bg(background)
                                             })
@@ -9896,6 +9910,7 @@ impl GitPanel {
                                                 move |_, _, cx| {
                                                     git_panel
                                                         .update(cx, |panel, cx| {
+                                                            panel.history_keyboard_nav = false;
                                                             if panel.focused_history_entry
                                                                 != Some(index)
                                                             {
@@ -9961,8 +9976,7 @@ impl GitPanel {
                                                                     sha.to_string(),
                                                                     open_repository.clone(),
                                                                     open_workspace.clone(),
-                                                                    None,
-                                                                    None,
+                                                                    Default::default(),
                                                                     window,
                                                                     cx,
                                                                 );
@@ -13126,7 +13140,7 @@ mod tests {
     async fn history_panel_setup(
         fs: Arc<FakeFs>,
         cx: &mut TestAppContext,
-    ) -> HistoryPanelTest {
+    ) -> (Entity<Project>, Entity<GitPanel>, VisualTestContext) {
         let project = Project::test(fs, [Path::new(path!("/root/project"))], cx).await;
         let window_handle =
             cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -13151,6 +13165,15 @@ mod tests {
 
         let panel = workspace.update_in(&mut cx, GitPanel::new);
 
+        (project, panel, cx)
+    }
+
+    async fn history_panel_for_project(
+        fs: Arc<FakeFs>,
+        cx: &mut TestAppContext,
+    ) -> HistoryPanelTest {
+        let (_, panel, mut cx) = history_panel_setup(fs, cx).await;
+        let workspace = panel.read_with(&cx, |panel, _| panel.workspace.upgrade().unwrap());
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.activate_history_tab(&ActivateHistoryTab, window, cx);
         });
@@ -13654,7 +13677,7 @@ mod tests {
         })
         .unwrap();
 
-        let panel = history_panel_for_project(fs.clone(), cx).await;
+        let panel = history_panel_for_project(fs.clone(), cx).await.panel;
         wait_for_commit_history_to_settle(&panel, cx).await;
 
         panel.read_with(cx, |panel, _| {
@@ -13931,6 +13954,7 @@ mod tests {
 
     /// Opens a History tab over three commits, returned newest first.
     async fn history_panel_with_commits(cx: &mut TestAppContext) -> (HistoryPanelTest, [Oid; 3]) {
+        set_git_panel_layout(cx, GitPanelLayout::Tabs);
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
             .await;
@@ -14037,7 +14061,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_history_tab_focuses_active_commit_after_reload(cx: &mut TestAppContext) {
+    async fn test_history_tab_keeps_active_commit_focus_across_tabs(cx: &mut TestAppContext) {
         init_test(cx);
 
         let (mut test, [_, _, oldest_sha]) = history_panel_with_commits(cx).await;
@@ -14046,7 +14070,7 @@ mod tests {
         test.panel.update_in(&mut test.cx, |panel, window, cx| {
             panel.activate_changes_tab(&ActivateChangesTab, window, cx);
         });
-        assert_eq!(test.history_state(), (Some(oldest_sha), None));
+        assert_eq!(test.history_state(), (Some(oldest_sha), Some(2)));
 
         test.panel.update_in(&mut test.cx, |panel, window, cx| {
             panel.activate_history_tab(&ActivateHistoryTab, window, cx);
@@ -14055,7 +14079,7 @@ mod tests {
         assert_eq!(
             test.history_state(),
             (Some(oldest_sha), Some(2)),
-            "reloading the history should place the cursor on the active commit"
+            "returning to cached history should keep the cursor on the active commit"
         );
     }
 
