@@ -306,6 +306,8 @@ actions!(
         CycleFavoriteModels,
         /// Expands the message editor to full size.
         ExpandMessageEditor,
+        /// Collapses the message editor to a slim bar, or restores it.
+        ToggleCollapseMessageEditor,
         /// Archives the currently selected thread.
         ArchiveSelectedThread,
         /// Removes the currently selected thread.

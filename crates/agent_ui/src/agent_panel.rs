@@ -37,6 +37,7 @@ use zed_actions::{
 
 use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
+use crate::ToggleCollapseMessageEditor;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
@@ -398,6 +399,13 @@ pub fn init(cx: &mut App) {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         workspace.focus_panel::<AgentPanel>(window, cx);
                         panel.update(cx, |panel, cx| panel.expand_message_editor(window, cx));
+                    }
+                })
+                .register_action(|workspace, _: &ToggleCollapseMessageEditor, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            panel.toggle_collapse_message_editor(window, cx)
+                        });
                     }
                 })
                 .register_action(|workspace, _: &OpenSettings, window, cx| {
@@ -3626,6 +3634,20 @@ impl AgentPanel {
         active_thread.update(cx, |active_thread, cx| {
             active_thread.expand_message_editor(&ExpandMessageEditor, window, cx);
             active_thread.activation_focus_handle(cx).focus(window, cx);
+        })
+    }
+
+    fn toggle_collapse_message_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(conversation_view) = self.active_conversation_view() else {
+            return;
+        };
+
+        let Some(active_thread) = conversation_view.read(cx).root_thread_view() else {
+            return;
+        };
+
+        active_thread.update(cx, |active_thread, cx| {
+            active_thread.toggle_collapse_message_editor(&ToggleCollapseMessageEditor, window, cx);
         })
     }
 
