@@ -84,6 +84,7 @@ members = [
     "crates/file_content",
     "crates/file_finder",
     "crates/file_icons",
+    "crates/fork_updater",
     "crates/fs",
     "crates/fs_benchmarks",
     "crates/fuzzy",
@@ -362,6 +363,7 @@ feedback = { path = "crates/feedback" }
 file_content = { path = "crates/file_content" }
 file_finder = { path = "crates/file_finder" }
 file_icons = { path = "crates/file_icons" }
+fork_updater = { path = "crates/fork_updater" }
 fs = { path = "crates/fs" }
 fuzzy = { path = "crates/fuzzy" }
 fuzzy_nucleo = { path = "crates/fuzzy_nucleo" }

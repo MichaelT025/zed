@@ -6546,6 +6546,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fork_updater"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "gpui",
+ "http_client",
+ "log",
+ "release_channel",
+ "serde",
+ "serde_json",
+ "settings",
+ "smol",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22583,6 +22601,7 @@ dependencies = [
  "feature_flags",
  "feedback",
  "file_finder",
+ "fork_updater",
  "fs",
  "futures 0.3.34",
  "git",
