@@ -771,6 +771,7 @@ pub struct ThreadView {
     pub plan_expanded: bool,
     pub queue_expanded: bool,
     pub editor_expanded: bool,
+    pub editor_collapsed: bool,
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
     pub message_queue: MessageQueue,
@@ -1303,6 +1304,7 @@ impl ThreadView {
             plan_expanded: false,
             queue_expanded: true,
             editor_expanded: false,
+            editor_collapsed: false,
             should_be_following: false,
             editing_message: None,
             message_queue: MessageQueue::default(),
@@ -3280,7 +3282,37 @@ impl ThreadView {
         if !self.has_visible_conversation(cx) {
             return;
         }
+        self.editor_collapsed = false;
         self.set_editor_is_expanded(!self.editor_expanded, cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub fn toggle_collapse_message_editor(
+        &mut self,
+        _: &ToggleCollapseMessageEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.has_visible_conversation(cx) {
+            return;
+        }
+        let message_editor_focus_handle = self.message_editor.focus_handle(cx);
+        if self.editor_collapsed {
+            self.editor_collapsed = false;
+            // When toggled from outside the panel (the binding is global), leave focus where it is.
+            if self.focus_handle.contains_focused(window, cx) {
+                message_editor_focus_handle.focus(window, cx);
+            }
+        } else {
+            self.editor_collapsed = true;
+            if self.editor_expanded {
+                self.set_editor_is_expanded(false, cx);
+            }
+            if message_editor_focus_handle.contains_focused(window, cx) {
+                self.focus_handle.focus(window, cx);
+            }
+        }
         cx.stop_propagation();
         cx.notify();
     }
@@ -5564,6 +5596,93 @@ impl ThreadView {
                 .into_any_element();
         }
 
+        let has_messages = self.has_visible_conversation(cx);
+        if self.editor_collapsed
+            && self
+                .message_editor
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+        {
+            self.editor_collapsed = false;
+        }
+
+        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+
+        if self.editor_collapsed && has_messages {
+            // The composer isn't rendered while collapsed, so tooltips resolve
+            // their keybindings through the thread's own focus handle.
+            let focus_handle = self.focus_handle.clone();
+            // Mirrors the open composer's layout so the buttons stay in place.
+            return h_flex()
+                .py_1()
+                .bg(cx.theme().colors().editor_background)
+                .justify_center()
+                .border_t_1()
+                .border_color(cx.theme().colors().border)
+                .child(
+                    h_flex()
+                        .when_some(max_content_width, |this, max_w| this.flex_basis(max_w))
+                        .when(max_content_width.is_none(), |this| this.w_full())
+                        .min_w_0()
+                        .px_2()
+                        .flex_shrink_1()
+                        .flex_grow_0()
+                        .justify_end()
+                        .child(
+                            h_flex()
+                                .opacity(0.5)
+                                .hover(|s| s.opacity(1.0))
+                                .gap_0p5()
+                                .child(
+                                    IconButton::new("collapse-message-editor", IconName::ChevronUp)
+                                        .icon_size(IconSize::Small)
+                                        .icon_color(Color::Muted)
+                                        .tooltip({
+                                            let focus_handle = focus_handle.clone();
+                                            move |_window, cx| {
+                                                Tooltip::for_action_in(
+                                                    "Show Message Editor",
+                                                    &ToggleCollapseMessageEditor,
+                                                    &focus_handle,
+                                                    cx,
+                                                )
+                                            }
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.toggle_collapse_message_editor(
+                                                &ToggleCollapseMessageEditor,
+                                                window,
+                                                cx,
+                                            );
+                                            this.message_editor.focus_handle(cx).focus(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    IconButton::new("toggle-height", IconName::Maximize)
+                                        .icon_size(IconSize::Small)
+                                        .icon_color(Color::Muted)
+                                        .tooltip(move |_window, cx| {
+                                            Tooltip::for_action_in(
+                                                "Expand Message Editor",
+                                                &ExpandMessageEditor,
+                                                &focus_handle,
+                                                cx,
+                                            )
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.expand_message_editor(
+                                                &ExpandMessageEditor,
+                                                window,
+                                                cx,
+                                            );
+                                            this.message_editor.focus_handle(cx).focus(window, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element();
+        }
+
         let focus_handle = self.message_editor.focus_handle(cx);
         let editor_bg_color = cx.theme().colors().editor_background;
 
@@ -5574,8 +5693,6 @@ impl ThreadView {
             (IconName::Maximize, "Expand Message Editor")
         };
 
-        let max_content_width = AgentSettings::get_global(cx).max_content_width;
-        let has_messages = self.has_visible_conversation(cx);
         let fills_container = !has_messages || editor_expanded;
         let composer_is_read_only = self.message_editor.read(cx).editor().read(cx).read_only(cx);
         let discard_draft_button = composer_is_read_only.then(|| {
@@ -5638,6 +5755,35 @@ impl ThreadView {
                                         .right_0()
                                         .opacity(0.5)
                                         .hover(|s| s.opacity(1.0))
+                                        .gap_0p5()
+                                        .child(
+                                            IconButton::new(
+                                                "collapse-message-editor",
+                                                IconName::ChevronDown,
+                                            )
+                                            .icon_size(IconSize::Small)
+                                            .icon_color(Color::Muted)
+                                            .tooltip({
+                                                let focus_handle = focus_handle.clone();
+                                                move |_window, cx| {
+                                                    Tooltip::for_action_in(
+                                                        "Collapse Message Editor",
+                                                        &ToggleCollapseMessageEditor,
+                                                        &focus_handle,
+                                                        cx,
+                                                    )
+                                                }
+                                            })
+                                            .on_click(
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.toggle_collapse_message_editor(
+                                                        &ToggleCollapseMessageEditor,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }),
+                                            ),
+                                        )
                                         .child(
                                             IconButton::new("toggle-height", expand_icon)
                                                 .icon_size(IconSize::Small)
@@ -14017,6 +14163,7 @@ impl Render for ThreadView {
         v_flex()
             .key_context("AcpThread")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::toggle_collapse_message_editor))
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
                 if this.parent_session_id.is_none() {
                     this.cancel_generation(cx);
