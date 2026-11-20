@@ -8,8 +8,8 @@ feature branch at a time.
 
 | Branch        | Purpose                                                              |
 |---------------|----------------------------------------------------------------------|
-| `main`        | Mirror of `upstream/main` plus this file. No feature work, ever.     |
-| `integration` | The fork itself: `main` plus every finished fork feature. Long-lived. |
+| `main`        | Exact mirror of `upstream/main`. No fork commits, ever.              |
+| `integration` | The fork itself: `main` plus this file and every finished fork feature. Long-lived; the GitHub default branch. |
 | `feature/*`   | One branch per feature in progress, created from `integration`.      |
 
 Changes only flow out of `main`, never into it:
@@ -74,8 +74,9 @@ Upstream changes heavily touched files often. To keep updates cheap:
 
 ## Changing this file
 
-Edit `FORK.md` only on `main`, then merge `main` into `integration`. If you're
-on a feature branch and think it needs a change, tell the user instead.
+`FORK.md` lives only on `integration`, so `main` stays fast-forwardable. Edit it
+on `integration` directly. If you're on a feature branch and think it needs a
+change, tell the user instead.
 
 ## Building on this machine
 
