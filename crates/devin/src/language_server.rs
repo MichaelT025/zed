@@ -15,7 +15,7 @@ use futures::{
     AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, FutureExt as _, channel::oneshot,
 };
 use gpui::{BackgroundExecutor, Task};
-use http_client::{AsyncBody, HttpClient, HttpRequestExt as _, Method, Request};
+use http_client::{AsyncBody, HttpClient, HttpRequestExt as _, Method, Request, StatusCode};
 use parking_lot::Mutex;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
@@ -24,10 +24,12 @@ use uuid::Uuid;
 
 use crate::lsp_connection::{LspConnection, WorkspaceFolder};
 use crate::protocol::{
-    Document, EXTENSION_SERVER_SERVICE, EditorOptions, GetUserStatusResponse,
-    HandleStreamingTabV2Request, HandleStreamingTabV2Response, IdeAction, LANGUAGE_SERVER_SERVICE,
-    Metadata, MetadataRequest, ProtobufValue, ProvideCompletionFeedbackRequest, ProviderSource,
-    RefreshContextForIdeActionRequest, SupercompleteTriggerCondition, decode_protobuf_fields,
+    CONNECT_COMPRESSED_FLAG, CONNECT_END_STREAM_FLAG, Document, EXTENSION_SERVER_SERVICE,
+    EditorOptions, GetUserStatusResponse, HandleStreamingTabV2Request,
+    HandleStreamingTabV2Response, IdeAction, LANGUAGE_SERVER_SERVICE, Metadata, MetadataRequest,
+    ProtobufValue, ProvideCompletionFeedbackRequest, ProviderSource,
+    RefreshContextForIdeActionRequest, StreamTabSuggestionsRequest, StreamTabSuggestionsResponse,
+    SupercompleteTriggerCondition, decode_protobuf_fields, encode_connect_envelope,
     encode_native_values_response, encode_set_native_value_response, parse_language_server_started,
 };
 
@@ -254,16 +256,8 @@ impl DevinLanguageServer {
             http_client,
             base_url: format!("http://127.0.0.1:{port}"),
             csrf_token,
+            devin_version: installation.distribution_version.clone(),
         });
-
-        rpc.call::<_, serde_json::Value>(
-            "InitializeCascadePanelState",
-            &json!({ "metadata": metadata, "is_workspace_trusted": true }),
-            RPC_TIMEOUT,
-        )
-        .await
-        .context("InitializeCascadePanelState")
-        .log_err();
 
         let status: GetUserStatusResponse = rpc
             .call(
@@ -291,14 +285,6 @@ impl DevinLanguageServer {
             {
                 metadata.team_id = team_id.to_string();
             }
-            rpc.call::<_, serde_json::Value>(
-                "UpdatePanelStateWithUserStatus",
-                &json!({ "metadata": metadata, "user_status": user_status }),
-                RPC_TIMEOUT,
-            )
-            .await
-            .context("UpdatePanelStateWithUserStatus")
-            .log_err();
         }
 
         rpc.call::<_, serde_json::Value>(
@@ -406,26 +392,28 @@ impl DevinLanguageServer {
         }
         self.refresh_context_if_needed(&document, &other_documents)
             .await?;
-        let request = HandleStreamingTabV2Request {
-            metadata: self.next_metadata(),
-            document,
-            editor_options,
-            supercomplete_trigger_condition: trigger,
-            other_documents,
-            disable_supercomplete: false,
-            disable_tab_jump: false,
-            supercomplete_aggression: "SUPERCOMPLETE_AGGRESSION_MEDIUM",
+        let request = StreamTabSuggestionsRequest {
+            request: HandleStreamingTabV2Request {
+                metadata: self.next_metadata(),
+                document,
+                editor_options,
+                supercomplete_trigger_condition: trigger,
+                other_documents,
+                disable_supercomplete: false,
+                disable_tab_jump: false,
+                supercomplete_aggression: "SUPERCOMPLETE_AGGRESSION_MEDIUM",
+            },
         };
         let started_at = Instant::now();
         // The HTTP timeout only backs up the completion timeout, which ends the request first.
-        let call = self
-            .rpc
-            .call::<_, HandleStreamingTabV2Response>(
-                "HandleStreamingTabV2",
-                &request,
-                COMPLETION_TIMEOUT * 2,
-            )
-            .fuse();
+        let call = async {
+            let mut stream = self
+                .rpc
+                .begin_server_stream("StreamTabSuggestions", &request, COMPLETION_TIMEOUT * 2)
+                .await?;
+            read_suggestion(&mut stream, trigger).await
+        }
+        .fuse();
         let timeout = self.executor.timer(COMPLETION_TIMEOUT).fuse();
         futures::pin_mut!(call, timeout);
         let result = futures::select_biased! {
@@ -532,7 +520,7 @@ impl DevinLanguageServer {
                         metadata: self.next_metadata(),
                         active_document: active_document.clone(),
                         other_documents: other_documents.to_vec(),
-                        recently_opened_uris: std::iter::once(document)
+                        open_document_uris: std::iter::once(document)
                             .chain(other_documents)
                             .map(|document| document.absolute_uri.clone())
                             .collect(),
@@ -569,6 +557,13 @@ struct RpcError {
 
 impl std::fmt::Display for RpcError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.status.is_empty() {
+            return write!(
+                formatter,
+                "{} returned {}: {}",
+                self.method, self.code, self.message
+            );
+        }
         write!(
             formatter,
             "{} returned {} {}: {}",
@@ -583,56 +578,276 @@ struct Rpc {
     http_client: Arc<dyn HttpClient>,
     base_url: String,
     csrf_token: String,
+    devin_version: String,
 }
 
 impl Rpc {
+    fn http_request(
+        &self,
+        method: &str,
+        content_type: &str,
+        body: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Request<AsyncBody>> {
+        Ok(Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "{}{LANGUAGE_SERVER_SERVICE}{method}",
+                self.base_url
+            ))
+            .header("Content-Type", content_type)
+            .header("Connect-Protocol-Version", "1")
+            .header("x-codeium-csrf-token", &self.csrf_token)
+            .timeout(timeout)
+            .body(AsyncBody::from(body))?)
+    }
+
+    /// Builds the error `call` and the stream reader report for a non-2xx response.
+    fn rpc_error(&self, method: &str, status: StatusCode, body: &[u8]) -> RpcError {
+        rpc_error(method, &self.devin_version, status, body)
+    }
+
     async fn call<Req: Serialize, Res: DeserializeOwned>(
         &self,
         method: &str,
         request: &Req,
         timeout: Duration,
     ) -> Result<Res> {
-        let body = serde_json::to_vec(request)?;
-        let http_request = Request::builder()
-            .method(Method::POST)
-            .uri(format!(
-                "{}{LANGUAGE_SERVER_SERVICE}{method}",
-                self.base_url
-            ))
-            .header("Content-Type", "application/json")
-            .header("Connect-Protocol-Version", "1")
-            .header("x-codeium-csrf-token", &self.csrf_token)
-            .timeout(timeout)
-            .body(AsyncBody::from(body))?;
-        let mut response = self
+        let http_request = self.http_request(
+            method,
+            "application/json",
+            serde_json::to_vec(request)?,
+            timeout,
+        )?;
+        let response = self
             .http_client
             .send(http_request)
             .await
             .with_context(|| format!("{method} request failed"))?;
-        let mut body = Vec::new();
-        response.body_mut().read_to_end(&mut body).await?;
-        if !response.status().is_success() {
-            let error = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
-            let field = |name: &str| {
-                error
-                    .get(name)
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            };
-            return Err(RpcError {
-                method: method.to_string(),
-                status: response.status().to_string(),
-                code: field("code"),
-                message: field("message"),
-            }
-            .into());
+        let status = response.status();
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        body.read_to_end(&mut bytes).await?;
+        if !status.is_success() {
+            return Err(self.rpc_error(method, status, &bytes).into());
         }
-        if body.is_empty() {
-            body = b"{}".to_vec();
+        if bytes.is_empty() {
+            bytes = b"{}".to_vec();
         }
-        serde_json::from_slice(&body).with_context(|| format!("failed to parse {method} response"))
+        serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {method} response"))
     }
+
+    /// Starts a Connect server-streaming call. The request body is a single enveloped message;
+    /// the response body is read frame by frame by [`ServerStream`].
+    async fn begin_server_stream<Req: Serialize>(
+        &self,
+        method: &str,
+        request: &Req,
+        timeout: Duration,
+    ) -> Result<ServerStream> {
+        let body = encode_connect_envelope(&serde_json::to_vec(request)?)?;
+        let http_request = self.http_request(method, "application/connect+json", body, timeout)?;
+        let response = self
+            .http_client
+            .send(http_request)
+            .await
+            .with_context(|| format!("{method} request failed"))?;
+        let status = response.status();
+        let mut body = response.into_body();
+        if !status.is_success() {
+            let mut bytes = Vec::new();
+            body.read_to_end(&mut bytes).await?;
+            return Err(self.rpc_error(method, status, &bytes).into());
+        }
+        Ok(ServerStream::new(method, body))
+    }
+}
+
+/// The largest frame accepted from the stream, so that a malformed length can't force a huge
+/// allocation. Language server frames carry a document-sized diff, well under this.
+const MAX_STREAM_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+fn rpc_error(method: &str, devin_version: &str, status: StatusCode, body: &[u8]) -> RpcError {
+    let error = serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
+    let field = |name: &str| {
+        error
+            .get(name)
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut message = field("message");
+    if status == StatusCode::NOT_FOUND {
+        // A missing route means Devin renamed or removed the RPC, not that the request was
+        // wrong. Say so instead of leaving a bare 404 in the logs.
+        let server_message = std::mem::take(&mut message);
+        message = format!(
+            "the {method} route is missing from Devin's language server (Devin {devin_version}), likely because Devin was updated and this provider needs updating"
+        );
+        if !server_message.is_empty() {
+            message.push_str(&format!(": {server_message}"));
+        }
+    }
+    RpcError {
+        method: method.to_string(),
+        status: status.to_string(),
+        code: field("code"),
+        message,
+    }
+}
+
+/// A server-streaming Connect response, decoded one length-prefixed JSON frame at a time.
+struct ServerStream {
+    method: String,
+    body: AsyncBody,
+}
+
+impl ServerStream {
+    fn new(method: impl Into<String>, body: AsyncBody) -> Self {
+        Self {
+            method: method.into(),
+            body,
+        }
+    }
+
+    /// Returns the next message, or `None` once the server ends the stream. An error trailer ends
+    /// the stream with the same error type a unary call would have produced.
+    async fn next_frame<Res: DeserializeOwned>(&mut self) -> Result<Option<Res>> {
+        let mut header = [0u8; 5];
+        if self.body.read(&mut header[..1]).await? == 0 {
+            return Ok(None);
+        }
+        self.body.read_exact(&mut header[1..]).await?;
+        let flags = header[0];
+        if flags & CONNECT_COMPRESSED_FLAG != 0 {
+            bail!(
+                "{} response is compressed, which is not supported",
+                self.method
+            );
+        }
+        let length = usize::try_from(u32::from_be_bytes([
+            header[1], header[2], header[3], header[4],
+        ]))?;
+        if length > MAX_STREAM_FRAME_BYTES {
+            bail!(
+                "{} response frame of {length} bytes exceeds the {MAX_STREAM_FRAME_BYTES} byte limit",
+                self.method
+            );
+        }
+        let mut payload = vec![0u8; length];
+        self.body.read_exact(&mut payload).await?;
+        if flags & CONNECT_END_STREAM_FLAG != 0 {
+            self.handle_end_stream(&payload)?;
+            return Ok(None);
+        }
+        serde_json::from_slice(&payload)
+            .map(Some)
+            .with_context(|| format!("failed to parse {} response frame", self.method))
+    }
+
+    fn handle_end_stream(&self, payload: &[u8]) -> Result<()> {
+        if payload.is_empty() {
+            return Ok(());
+        }
+        let trailer: serde_json::Value = serde_json::from_slice(payload)
+            .with_context(|| format!("failed to parse {} end-of-stream frame", self.method))?;
+        let error = trailer.get("error");
+        let text = |name: &str| {
+            error
+                .and_then(|error| error.get(name))
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let code = text("code");
+        if code.is_empty() {
+            return Ok(());
+        }
+        Err(RpcError {
+            method: self.method.clone(),
+            status: String::new(),
+            code,
+            message: text("message"),
+        }
+        .into())
+    }
+}
+
+/// Reads frames until the first usable suggestion or the end of the stream, returning the last
+/// response payload seen so that stop and filter reasons still surface.
+async fn read_suggestion(
+    stream: &mut ServerStream,
+    trigger: SupercompleteTriggerCondition,
+) -> Result<HandleStreamingTabV2Response> {
+    let mut last_response = HandleStreamingTabV2Response::default();
+    while let Some(frame) = stream.next_frame::<StreamTabSuggestionsResponse>().await? {
+        log::debug!(
+            "Devin completion frame ({trigger:?}): {} isFinal={} clientRequestId={:?}",
+            frame_summary(&frame),
+            frame.is_final,
+            frame.client_request_id
+        );
+        if let Some(candidate) = &frame.tab_jump_candidate
+            && frame
+                .response
+                .as_ref()
+                .is_none_or(|response| response.tab_jump.is_none())
+        {
+            // Devin's own client converts the candidate into a jump locally, which Zed doesn't
+            // do yet, so the frame is ignored rather than misread as an edit.
+            log::debug!(
+                "Devin sent a tab jump candidate for {:?} (finalized: {}), which Zed does not apply yet",
+                candidate.path,
+                candidate.finalized
+            );
+        }
+        let is_final = frame.is_final;
+        if let Some(response) = frame.response {
+            let is_suggestion = response.diff.is_some() || response.tab_jump.is_some();
+            last_response = response;
+            if is_suggestion {
+                // Later frames are either refinements or prefetches for the next request; the
+                // first usable one is what Devin's own client renders.
+                return Ok(last_response);
+            }
+        }
+        if is_final {
+            break;
+        }
+    }
+    Ok(last_response)
+}
+
+/// Names the fields a frame populated, for the per-frame debug log.
+fn frame_summary(frame: &StreamTabSuggestionsResponse) -> String {
+    let mut fields = Vec::new();
+    if let Some(response) = &frame.response {
+        if response.diff.is_some() {
+            fields.push("diff");
+        }
+        if response.tab_jump.is_some() {
+            fields.push("tabJump");
+        }
+        if response.noop.is_some() {
+            fields.push("noop");
+        }
+        if response.stop_reason.is_some() {
+            fields.push("stopReason");
+        }
+        if response.filter_reason.is_some() {
+            fields.push("filterReason");
+        }
+        if fields.is_empty() {
+            fields.push("response");
+        }
+    }
+    if frame.trigger_state.is_some() {
+        fields.push("triggerState");
+    }
+    if frame.tab_jump_candidate.is_some() {
+        fields.push("tabJumpCandidate");
+    }
+    format!("[{}]", fields.join(", "))
 }
 
 async fn log_output(output: impl futures::AsyncRead + Unpin, secrets: Arc<[String]>) {
@@ -936,4 +1151,215 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
             .zip(right)
             .fold(0u8, |difference, (left, right)| difference | (left ^ right))
             == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context as TaskContext, Poll},
+    };
+
+    use futures::AsyncRead;
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    /// Yields at most `chunk_size` bytes per read, so that frames can be split across reads the
+    /// way a real HTTP body can deliver them.
+    struct ChunkedReader {
+        data: Vec<u8>,
+        position: usize,
+        chunk_size: usize,
+    }
+
+    impl AsyncRead for ChunkedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buffer: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let remaining = self.data.len() - self.position;
+            let len = remaining.min(buffer.len()).min(self.chunk_size);
+            buffer[..len].copy_from_slice(&self.data[self.position..self.position + len]);
+            self.position += len;
+            Poll::Ready(Ok(len))
+        }
+    }
+
+    fn envelope(flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![flags];
+        frame.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("test frame fits in u32")
+                .to_be_bytes(),
+        );
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn stream_with_body(body: Vec<u8>, chunk_size: usize) -> ServerStream {
+        ServerStream::new(
+            "StreamTabSuggestions",
+            AsyncBody::from_reader(ChunkedReader {
+                data: body,
+                position: 0,
+                chunk_size,
+            }),
+        )
+    }
+
+    fn message_frame(response: serde_json::Value) -> Vec<u8> {
+        envelope(0, response.to_string().as_bytes())
+    }
+
+    fn end_stream_frame(trailer: serde_json::Value) -> Vec<u8> {
+        envelope(CONNECT_END_STREAM_FLAG, trailer.to_string().as_bytes())
+    }
+
+    #[test]
+    fn test_connect_envelope_round_trip() {
+        let encoded = encode_connect_envelope(br#"{"request":{}}"#).unwrap();
+        assert_eq!(&encoded[..5], &[0, 0, 0, 0, 14]);
+
+        let mut stream = stream_with_body(encoded, 3);
+        let frame: serde_json::Value = smol::block_on(stream.next_frame())
+            .unwrap()
+            .expect("expected one frame");
+        assert_eq!(frame, serde_json::json!({ "request": {} }));
+        assert!(
+            smol::block_on(stream.next_frame::<serde_json::Value>())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_stream_decodes_frames_split_across_reads() {
+        let mut body = Vec::new();
+        body.extend(message_frame(serde_json::json!({
+            "triggerState": { "filePathUri": "file:///project/a.rs", "contents": "one\n" }
+        })));
+        body.extend(message_frame(serde_json::json!({
+            "response": {
+                "completionId": "completion",
+                "diff": { "path": "file:///project/a.rs" }
+            },
+            "isFinal": true,
+            "clientRequestId": "42"
+        })));
+        body.extend(end_stream_frame(serde_json::json!({ "metadata": {} })));
+
+        // A chunk size that divides no frame boundary, so every header and payload spans reads.
+        let mut stream = stream_with_body(body, 3);
+
+        let first: StreamTabSuggestionsResponse =
+            smol::block_on(stream.next_frame()).unwrap().unwrap();
+        assert!(first.response.is_none());
+        assert_eq!(
+            first.trigger_state.unwrap().file_path_uri,
+            "file:///project/a.rs"
+        );
+
+        let second: StreamTabSuggestionsResponse =
+            smol::block_on(stream.next_frame()).unwrap().unwrap();
+        assert_eq!(second.client_request_id, Some(42));
+        assert!(second.is_final);
+        let response = second.response.expect("expected a response payload");
+        assert_eq!(response.completion_id, "completion");
+        assert!(response.diff.is_some());
+
+        assert!(
+            smol::block_on(stream.next_frame::<StreamTabSuggestionsResponse>())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_stream_end_of_stream_error_is_rpc_error() {
+        let body = end_stream_frame(serde_json::json!({
+            "error": { "code": "canceled", "message": "request superseded" }
+        }));
+        let mut stream = stream_with_body(body, 7);
+
+        let error = smol::block_on(stream.next_frame::<StreamTabSuggestionsResponse>())
+            .expect_err("expected the end-of-stream error");
+        let rpc_error = error
+            .downcast_ref::<RpcError>()
+            .expect("expected an RPC error");
+        assert_eq!(rpc_error.code, "canceled");
+        assert_eq!(rpc_error.message, "request superseded");
+    }
+
+    #[test]
+    fn test_stream_reads_first_usable_suggestion() {
+        let mut body = Vec::new();
+        body.extend(message_frame(serde_json::json!({
+            "triggerState": { "contents": "one\n" }
+        })));
+        body.extend(message_frame(serde_json::json!({
+            "response": { "completionId": "empty", "stopReason": "STOP_REASON_PARTIAL" }
+        })));
+        body.extend(message_frame(serde_json::json!({
+            "response": {
+                "completionId": "first",
+                "diff": { "path": "file:///project/a.rs" }
+            }
+        })));
+        // Reading past the first usable frame would fail on this truncated payload.
+        body.extend(envelope(0, b"{"));
+
+        let mut stream = stream_with_body(body, 5);
+        let response = smol::block_on(read_suggestion(
+            &mut stream,
+            SupercompleteTriggerCondition::Typing,
+        ))
+        .unwrap();
+        assert_eq!(response.completion_id, "first");
+        assert!(response.diff.is_some());
+    }
+
+    #[test]
+    fn test_stream_returns_last_response_when_no_suggestion_arrives() {
+        let mut body = Vec::new();
+        body.extend(message_frame(serde_json::json!({
+            "triggerState": { "contents": "one\n" }
+        })));
+        body.extend(message_frame(serde_json::json!({
+            "response": { "completionId": "empty", "stopReason": "STOP_REASON_NO_EDIT" },
+            "isFinal": true
+        })));
+        body.extend(end_stream_frame(serde_json::json!({})));
+
+        let mut stream = stream_with_body(body, 4);
+        let response = smol::block_on(read_suggestion(
+            &mut stream,
+            SupercompleteTriggerCondition::Typing,
+        ))
+        .unwrap();
+        assert_eq!(response.completion_id, "empty");
+        assert!(response.diff.is_none());
+        assert_eq!(
+            response.stop_reason,
+            Some(serde_json::json!("STOP_REASON_NO_EDIT"))
+        );
+    }
+
+    #[test]
+    fn test_missing_route_error_names_route_and_version() {
+        let error = rpc_error(
+            "StreamTabSuggestions",
+            "3.12.59",
+            StatusCode::NOT_FOUND,
+            br#"{"code":"unimplemented","message":"not found"}"#,
+        );
+        assert_eq!(error.code, "unimplemented");
+        let message = error.to_string();
+        assert!(message.contains("StreamTabSuggestions"));
+        assert!(message.contains("Devin 3.12.59"));
+        assert!(message.contains("needs updating"));
+        assert!(message.contains("not found"));
+    }
 }

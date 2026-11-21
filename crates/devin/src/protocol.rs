@@ -140,6 +140,13 @@ pub struct HandleStreamingTabV2Request {
     pub supercomplete_aggression: &'static str,
 }
 
+/// The request for `StreamTabSuggestions`, which wraps the tab request the older
+/// `HandleStreamingTabV2` route took directly.
+#[derive(Clone, Debug, Serialize)]
+pub struct StreamTabSuggestionsRequest {
+    pub request: HandleStreamingTabV2Request,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum IdeAction {
     #[serde(rename = "IDE_ACTION_STARTUP")]
@@ -153,7 +160,7 @@ pub struct RefreshContextForIdeActionRequest {
     pub metadata: Metadata,
     pub active_document: Document,
     pub other_documents: Vec<Document>,
-    pub recently_opened_uris: Vec<String>,
+    pub open_document_uris: Vec<String>,
     pub blocking: bool,
     pub ide_action: IdeAction,
 }
@@ -242,6 +249,39 @@ pub struct ResponsePosition {
     pub col: u64,
 }
 
+/// One frame of the `StreamTabSuggestions` server stream. Every field is optional, so frames are
+/// distinguished by which fields are set: a suggestion frame carries `response`, while later or
+/// intermediate frames may only carry the document snapshot or a tab jump candidate.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StreamTabSuggestionsResponse {
+    pub response: Option<HandleStreamingTabV2Response>,
+    pub is_final: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_u64_string")]
+    pub client_request_id: Option<u64>,
+    pub trigger_state: Option<TriggerState>,
+    pub tab_jump_candidate: Option<TabJumpCandidate>,
+}
+
+/// The document snapshot a suggestion was computed against.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TriggerState {
+    pub file_path_uri: String,
+    pub contents: String,
+    pub final_contents: String,
+    pub cursor: Option<ResponsePosition>,
+}
+
+/// Raw material Devin's own client turns into a tab jump locally. Zed ignores these frames for
+/// now; see `FOLLOW_UPS.md`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TabJumpCandidate {
+    pub path: String,
+    pub finalized: bool,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GetUserStatusResponse {
@@ -274,6 +314,42 @@ fn deserialize_u64_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
         StringOrNumber::String(string) => string.parse().map_err(serde::de::Error::custom),
         StringOrNumber::Number(number) => Ok(number),
     }
+}
+
+fn deserialize_optional_u64_string<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNumber {
+        String(String),
+        Number(u64),
+    }
+
+    match Option::<StringOrNumber>::deserialize(deserializer)? {
+        Some(StringOrNumber::String(string)) => {
+            string.parse().map(Some).map_err(serde::de::Error::custom)
+        }
+        Some(StringOrNumber::Number(number)) => Ok(Some(number)),
+        None => Ok(None),
+    }
+}
+
+/// Connect's streaming protocol frames each message with a flags byte and a big-endian length.
+/// The end-of-stream message is flagged rather than being an empty payload.
+pub const CONNECT_COMPRESSED_FLAG: u8 = 0x01;
+pub const CONNECT_END_STREAM_FLAG: u8 = 0x02;
+
+pub fn encode_connect_envelope(payload: &[u8]) -> Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(payload.len() + 5);
+    output.push(0);
+    output.extend_from_slice(
+        &u32::try_from(payload.len())
+            .context("streaming request payload is too large")?
+            .to_be_bytes(),
+    );
+    output.extend_from_slice(payload);
+    Ok(output)
 }
 
 fn encode_varint(output: &mut Vec<u8>, mut value: u64) {
